@@ -19,6 +19,11 @@ struct RuntimeState {
 
 const KEYRING_SERVICE: &str = "voxa-presentation-copilot";
 const GEMINI_MODEL: &str = "gemini-3.7-flash";
+// A 503 "high demand" means Google's shared capacity for that specific model
+// is temporarily saturated - unrelated to billing tier or quota, and not
+// something retries alone reliably fix. Falling back to another model keeps
+// the presenter's copilot answering instead of failing outright.
+const GEMINI_FALLBACK_MODELS: &[&str] = &["gemini-2.5-flash"];
 
 #[derive(Debug, Deserialize, Serialize)]
 struct SessionRecord {
@@ -438,41 +443,60 @@ QUESTION:
     }
     let key = gemini_key()?;
     let client = reqwest::blocking::Client::new();
-    // Google's own SDKs retry 429/5xx with backoff by default because model
-    // overload ("high demand") is common and self-resolves in a few seconds;
-    // a live copilot answer is worth a couple of retries before giving up.
-    let mut retry_delay = Duration::from_millis(800);
-    let value: serde_json::Value = loop {
-        let response = client
-            .post("https://generativelanguage.googleapis.com/v1beta/interactions")
-            .header("x-goog-api-key", &key)
-            .json(&body)
-            .send()
-            .map_err(|e| format!("Gemini request failed: {e}"))?;
-        let status = response.status();
-        if status.is_success() {
-            break response
-                .json()
-                .map_err(|e| format!("Invalid Gemini response: {e}"))?;
+    // Retry 429/5xx with backoff (Google's own SDKs do the same, since model
+    // overload is common and often self-resolves in a few seconds). If the
+    // primary model stays overloaded, fall back to another model instead of
+    // leaving the presenter without an answer - see GEMINI_FALLBACK_MODELS.
+    let candidates = std::iter::once(GEMINI_MODEL).chain(GEMINI_FALLBACK_MODELS.iter().copied());
+    let mut answer_value: Option<serde_json::Value> = None;
+    let mut last_message = String::new();
+    for model in candidates {
+        body["model"] = serde_json::Value::String(model.to_string());
+        let mut retry_delay = Duration::from_millis(800);
+        loop {
+            let response = client
+                .post("https://generativelanguage.googleapis.com/v1beta/interactions")
+                .header("x-goog-api-key", &key)
+                .json(&body)
+                .send()
+                .map_err(|e| format!("Gemini request failed: {e}"))?;
+            let status = response.status();
+            if status.is_success() {
+                answer_value = Some(
+                    response
+                        .json()
+                        .map_err(|e| format!("Invalid Gemini response: {e}"))?,
+                );
+                break;
+            }
+            let is_retryable = status.as_u16() == 429 || status.is_server_error();
+            let body_text = response.text().unwrap_or_default();
+            last_message = serde_json::from_str::<serde_json::Value>(&body_text)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(|message| message.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| format!("Gemini returned {status}"));
+            if !is_retryable {
+                // Not model-specific (bad request, invalid key, ...): retrying
+                // on a different model would fail the same way.
+                return Err(last_message);
+            }
+            if retry_delay > Duration::from_secs(4) {
+                break;
+            }
+            std::thread::sleep(retry_delay);
+            retry_delay *= 2;
         }
-        let is_retryable = status.as_u16() == 429 || status.is_server_error();
-        let body_text = response.text().unwrap_or_default();
-        let message = serde_json::from_str::<serde_json::Value>(&body_text)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("error")
-                    .and_then(|error| error.get("message"))
-                    .and_then(|message| message.as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| format!("Gemini returned {status}"));
-        if !is_retryable || retry_delay > Duration::from_secs(5) {
-            return Err(message);
+        if answer_value.is_some() {
+            break;
         }
-        std::thread::sleep(retry_delay);
-        retry_delay *= 2;
-    };
+    }
+    let value = answer_value.ok_or(last_message)?;
     let text = value["steps"]
         .as_array()
         .and_then(|steps| {
