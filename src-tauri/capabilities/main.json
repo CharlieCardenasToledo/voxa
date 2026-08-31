@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main-events",
+  "description": "Allow the main Voxa window to receive audio meter and transcription events.",
+  "windows": ["main"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

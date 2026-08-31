@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0b1118" />
+    <title>Voxa — Presentation Copilot</title>
+  </head>
+  <body>
+    <div id="root"><div id="startup-status" style="min-height:100vh;display:grid;place-items:center;background:#0b1118;color:#b8c8ce;font:14px system-ui">Loading Voxa…</div></div>
+    <script>
+      const showStartupError = (message) => {
+        const root = document.getElementById('root');
+        if (root && !root.querySelector('.app-shell')) root.innerHTML = `<div style="min-height:100vh;padding:48px;background:#0b1118;color:#f2f6f7;font:14px system-ui"><h1 style="font-size:22px">Voxa could not start</h1><pre style="white-space:pre-wrap;color:#ff9a8a">${String(message).replace(/[<>&]/g, '')}</pre><p>Close this window and run <code>npm run tauri:dev</code> again.</p></div>`;
+      };
+      window.addEventListener('error', event => showStartupError(event.message || event.error));
+      window.addEventListener('unhandledrejection', event => showStartupError(event.reason));
+      setTimeout(() => { if (document.getElementById('startup-status')) showStartupError('React did not mount within 10 seconds. Check the terminal for Vite errors.'); }, 10000);
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

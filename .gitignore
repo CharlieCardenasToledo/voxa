@@ -1,0 +1,26 @@
+# Node / frontend
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Rust / Tauri build output
+target/
+target2/
+target3/
+target4/
+target5/
+target6/
+src-tauri/target/
+src-tauri/gen/
+*.exe
+*.pdb
+
+# Local tooling
+.rtfm/
+.claude/settings.local.json
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
