@@ -1,4 +1,4 @@
-use crate::{gemini_key, live, validate_gemini_key_value, GEMINI_MODEL};
+use crate::{gemini_key, live, validate_gemini_key_value, GEMINI_FALLBACK_MODELS, GEMINI_MODEL};
 use serde::Serialize;
 use std::time::{Duration, Instant};
 
@@ -63,6 +63,10 @@ fn check_key(key: &str) -> HealthCheck {
     }
 }
 
+/// Mirrors the retry-then-fall-back-to-another-model behavior of
+/// `generate_copilot_answer`, so the health check reports what the app would
+/// actually do in production rather than failing it on a single overloaded
+/// model that the app itself already routes around.
 fn check_interactions(key: &str) -> HealthCheck {
     let label = "Text generation (Interactions API)";
     let started = Instant::now();
@@ -81,75 +85,85 @@ fn check_interactions(key: &str) -> HealthCheck {
             }
         }
     };
-    let body = serde_json::json!({ "model": GEMINI_MODEL, "input": "Reply with exactly one word: OK" });
-    let response = client
-        .post("https://generativelanguage.googleapis.com/v1beta/interactions")
-        .header("x-goog-api-key", key)
-        .json(&body)
-        .send();
-    let latency_ms = started.elapsed().as_millis() as u64;
-    let response = match response {
-        Ok(response) => response,
-        Err(error) => {
-            return HealthCheck {
-                id: "interactions",
-                label,
-                ok: false,
-                message: format!("Gemini request failed: {}", describe_error(&error)),
-                latency_ms,
+
+    let candidates = std::iter::once(GEMINI_MODEL).chain(GEMINI_FALLBACK_MODELS.iter().copied());
+    let mut last_message = String::new();
+    for model in candidates {
+        let body =
+            serde_json::json!({ "model": model, "input": "Reply with exactly one word: OK" });
+        let mut retry_delay = Duration::from_millis(800);
+        loop {
+            let response = client
+                .post("https://generativelanguage.googleapis.com/v1beta/interactions")
+                .header("x-goog-api-key", key)
+                .json(&body)
+                .send();
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    last_message = format!("Gemini request failed: {}", describe_error(&error));
+                    break;
+                }
+            };
+            let status = response.status();
+            if status.is_success() {
+                let latency_ms = started.elapsed().as_millis() as u64;
+                let value: serde_json::Value = match response.json() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return HealthCheck {
+                            id: "interactions",
+                            label,
+                            ok: false,
+                            message: format!("Invalid Gemini response: {error}"),
+                            latency_ms,
+                        }
+                    }
+                };
+                let has_output =
+                    value["steps"].as_array().is_some_and(|steps| !steps.is_empty());
+                if !has_output {
+                    last_message = "Gemini responded without any output steps.".into();
+                    break;
+                }
+                let note = if model == GEMINI_MODEL {
+                    String::new()
+                } else {
+                    format!(" (fell back to {model} - {GEMINI_MODEL} was unavailable)")
+                };
+                return HealthCheck {
+                    id: "interactions",
+                    label,
+                    ok: true,
+                    message: format!("Model {model} responded with output.{note}"),
+                    latency_ms,
+                };
             }
+            let is_retryable = status.as_u16() == 429 || status.is_server_error();
+            let body_text = response.text().unwrap_or_default();
+            last_message = serde_json::from_str::<serde_json::Value>(&body_text)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(|message| message.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| format!("Gemini returned {status}"));
+            if !is_retryable || retry_delay > Duration::from_secs(4) {
+                break;
+            }
+            std::thread::sleep(retry_delay);
+            retry_delay *= 2;
         }
-    };
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        let message = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("error")
-                    .and_then(|error| error.get("message"))
-                    .and_then(|message| message.as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| format!("Gemini returned {status}"));
-        return HealthCheck {
-            id: "interactions",
-            label,
-            ok: false,
-            message,
-            latency_ms,
-        };
     }
-    let value: serde_json::Value = match response.json() {
-        Ok(value) => value,
-        Err(error) => {
-            return HealthCheck {
-                id: "interactions",
-                label,
-                ok: false,
-                message: format!("Invalid Gemini response: {error}"),
-                latency_ms,
-            }
-        }
-    };
-    let has_output = value["steps"].as_array().is_some_and(|steps| !steps.is_empty());
-    if has_output {
-        HealthCheck {
-            id: "interactions",
-            label,
-            ok: true,
-            message: format!("Model {GEMINI_MODEL} responded with output."),
-            latency_ms,
-        }
-    } else {
-        HealthCheck {
-            id: "interactions",
-            label,
-            ok: false,
-            message: "Gemini responded without any output steps.".into(),
-            latency_ms,
-        }
+    HealthCheck {
+        id: "interactions",
+        label,
+        ok: false,
+        message: last_message,
+        latency_ms: started.elapsed().as_millis() as u64,
     }
 }
 

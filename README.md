@@ -8,6 +8,7 @@ Aplicación local de escritorio para Windows basada en Tauri 2, React y Rust.
 - Rust stable `x86_64-pc-windows-msvc`.
 - Visual Studio Build Tools con C++.
 - Node.js 20+.
+- Python 3.10+ en el `PATH` (como `python`), con `pip install google-genai`. La transcripción en vivo la maneja un sidecar de Python (`src-tauri/python/live_bridge.py`) que usa el SDK oficial de Google — ver "Por qué Python" más abajo. Si tu intérprete no se llama `python`, define `VOXA_PYTHON` con la ruta completa.
 
 ## Levantar Tauri localmente
 
@@ -50,6 +51,14 @@ Dentro de `Settings` hay un botón **Run health check** que prueba por separado 
 3. **Live transcription (WebSocket)** — abre una sesión real contra `wss://.../BidiGenerateContent` con el modelo `gemini-3.5-transcribe-live` y espera `setupComplete`.
 
 Cada verificación reporta OK/error, el mensaje devuelto por Google y la latencia, para poder distinguir entre "la clave no es válida", "el modelo está saturado" y "algo en la red (firewall/proxy/antivirus) bloquea las conexiones salientes a Gemini" — que son fallas con soluciones muy distintas.
+
+### Por qué Python para la transcripción en vivo
+
+`src-tauri/src/live.rs` no habla el WebSocket de Gemini Live directamente: lanza `python src-tauri/python/live_bridge.py` como subproceso y le habla por stdin/stdout con un protocolo JSON de una línea (`{"audio": "<base64>"}`, `{"end": true}` → `{"status": "connected"}`, `{"transcript": "...", "interim": bool}`, `{"error": "..."}`).
+
+Esto no es una preferencia de estilo: el cliente WebSocket de Rust (`tungstenite` + `rustls`) se quedaba colgado esperando `setupComplete` de forma reproducible contra este endpoint/modelo específico, mientras que la petición idéntica (misma key, mismo JSON, mismo instante) funcionaba en menos de 1 segundo con el SDK oficial de Google en Python — y hasta con la librería `websockets` cruda. Sin poder capturar el tráfico TLS en este entorno para encontrar la diferencia exacta, se optó por usar el SDK que Google sí mantiene para este propósito en vez de seguir depurando a ciegas.
+
+Si Voxa reporta que la transcripción en vivo no conecta, primero verifica que `python` esté en el `PATH` y que `google-genai` esté instalado (`python -m pip show google-genai`).
 
 ## Modo mock
 
