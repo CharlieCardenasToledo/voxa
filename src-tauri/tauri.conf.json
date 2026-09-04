@@ -4,6 +4,6 @@
   "version": "0.1.0",
   "identifier": "com.voxa.presentation-copilot",
   "build": { "beforeBuildCommand": "npm run build", "frontendDist": "../dist" },
-  "app": { "windows": [{ "title": "Voxa — Presentation Copilot", "width": 1280, "height": 820, "minWidth": 1040, "minHeight": 700, "resizable": true, "alwaysOnTop": false }], "security": { "csp": null } },
-  "bundle": { "active": false, "targets": "all", "icon": [] }
+  "app": { "windows": [{ "title": "Voxa — Copiloto de presentaciones", "width": 1280, "height": 820, "minWidth": 1040, "minHeight": 700, "resizable": true, "alwaysOnTop": false }], "security": { "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self'" } },
+  "bundle": { "active": true, "targets": ["nsis"], "icon": ["icons/icon.ico"], "resources": ["binaries/voxa-live-bridge.exe"] }
 }

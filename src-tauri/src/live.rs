@@ -11,6 +11,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+#[cfg(not(debug_assertions))]
+use tauri::{path::BaseDirectory, Manager};
 use tauri::{AppHandle, Emitter};
 
 const MODEL: &str = "gemini-3.5-transcribe-live";
@@ -24,24 +26,40 @@ const MODEL: &str = "gemini-3.5-transcribe-live";
 /// to a small Python bridge (`python/live_bridge.py`) that uses the SDK
 /// Google actually maintains for the Live API, and only speak a tiny
 /// newline-JSON protocol with it over stdin/stdout.
+#[cfg(debug_assertions)]
 const BRIDGE_SCRIPT: &str = include_str!("../python/live_bridge.py");
 
 fn python_command() -> String {
     std::env::var("VOXA_PYTHON").unwrap_or_else(|_| "python".to_string())
 }
 
+#[cfg(debug_assertions)]
 fn bridge_script_path() -> Result<std::path::PathBuf, String> {
     let path = std::env::temp_dir().join("voxa_live_bridge.py");
     std::fs::write(&path, BRIDGE_SCRIPT)
-        .map_err(|error| format!("Could not write the Live bridge script: {error}"))?;
+        .map_err(|error| format!("No se pudo preparar el componente de transcripción: {error}"))?;
     Ok(path)
 }
 
-fn spawn_bridge() -> Result<Child, String> {
-    let script = bridge_script_path()?;
-    let mut command = Command::new(python_command());
+fn spawn_bridge(_app: &AppHandle) -> Result<Child, String> {
+    #[cfg(debug_assertions)]
+    let mut command = {
+        let script = bridge_script_path()?;
+        let mut command = Command::new(python_command());
+        command.arg(script);
+        command
+    };
+    #[cfg(not(debug_assertions))]
+    let mut command = {
+        let binary = _app
+            .path()
+            .resolve("binaries/voxa-live-bridge.exe", BaseDirectory::Resource)
+            .map_err(|error| {
+                format!("No se encontró el componente de transcripción incluido: {error}")
+            })?;
+        Command::new(binary)
+    };
     command
-        .arg(&script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -54,8 +72,8 @@ fn spawn_bridge() -> Result<Child, String> {
     command.spawn().map_err(|error| {
         format!(
             "Could not start the Python Live bridge ({}): {error}. \
-             Install Python 3.10+ and `pip install google-genai`, or set VOXA_PYTHON.",
-            python_command()
+             In development, install Python 3.10+ and `pip install google-genai`, or set VOXA_PYTHON.",
+            python_command(),
         )
     })
 }
@@ -68,7 +86,15 @@ fn write_line(stdin: &mut ChildStdin, value: &serde_json::Value) -> std::io::Res
 /// One line of output from the bridge, already classified.
 enum BridgeEvent {
     Connected,
-    Transcript { text: String, interim: bool },
+    Transcript {
+        text: String,
+        interim: bool,
+    },
+    Usage {
+        input_tokens: u64,
+        output_tokens: u64,
+        total_tokens: u64,
+    },
     Error(String),
     ProcessEnded,
 }
@@ -89,6 +115,22 @@ fn parse_bridge_line(line: &str) -> Option<BridgeEvent> {
         return Some(BridgeEvent::Transcript {
             text: text.to_string(),
             interim,
+        });
+    }
+    if let Some(usage) = value.get("usage") {
+        return Some(BridgeEvent::Usage {
+            input_tokens: usage
+                .get("input_tokens")
+                .and_then(|item| item.as_u64())
+                .unwrap_or(0),
+            output_tokens: usage
+                .get("output_tokens")
+                .and_then(|item| item.as_u64())
+                .unwrap_or(0),
+            total_tokens: usage
+                .get("total_tokens")
+                .and_then(|item| item.as_u64())
+                .unwrap_or(0),
         });
     }
     None
@@ -134,7 +176,9 @@ fn spawn_bridge_readers(mut child: Child) -> (Child, Receiver<BridgeEvent>) {
                 buffer.push_str(&line);
             }
             if !buffer.is_empty() {
-                let _ = tx.send(BridgeEvent::Error(format!("Live bridge: {buffer}")));
+                let _ = tx.send(BridgeEvent::Error(format!(
+                    "Transcripción en vivo: {buffer}"
+                )));
             }
         });
     }
@@ -196,15 +240,20 @@ fn spawn_transcriber(
 ) {
     thread::spawn(move || {
         let mut retry_delay = Duration::from_secs(1);
+        let mut accumulated_input = 0_u64;
+        let mut accumulated_output = 0_u64;
         while !stop.load(Ordering::Relaxed) {
             // Audio captured before a connection is ready is stale. Sending the
             // backlog in a burst can immediately trigger Gemini rate limits.
             while rx.try_recv().is_ok() {}
 
-            let child = match spawn_bridge() {
+            let child = match spawn_bridge(&app) {
                 Ok(child) => child,
                 Err(error) => {
-                    let _ = app.emit("transcription-error", json!({"speaker":speaker,"error":error}));
+                    let _ = app.emit(
+                        "transcription-error",
+                        json!({"speaker":speaker,"error":error}),
+                    );
                     sleep_before_retry(&stop, retry_delay);
                     retry_delay = next_retry_delay(retry_delay);
                     continue;
@@ -231,7 +280,10 @@ fn spawn_transcriber(
             match wait_for_connected(&events, Instant::now() + Duration::from_secs(30)) {
                 Ok(()) => {}
                 Err(error) => {
-                    let _ = app.emit("transcription-error", json!({"speaker":speaker,"error":error}));
+                    let _ = app.emit(
+                        "transcription-error",
+                        json!({"speaker":speaker,"error":error}),
+                    );
                     let _ = child.kill();
                     sleep_before_retry(&stop, retry_delay);
                     retry_delay = next_retry_delay(retry_delay);
@@ -249,14 +301,20 @@ fn spawn_transcriber(
             );
 
             let connected_at = Instant::now();
+            let mut session_input = 0_u64;
+            let mut session_output = 0_u64;
+            let mut graceful_rotation_deadline: Option<Instant> = None;
             'session: loop {
-                if stop.load(Ordering::Relaxed) || connected_at.elapsed() > Duration::from_secs(8 * 60)
+                if stop.load(Ordering::Relaxed)
+                    || connected_at.elapsed() > Duration::from_secs(9 * 60 + 30)
+                    || graceful_rotation_deadline.is_some_and(|deadline| Instant::now() >= deadline)
                 {
                     let _ = child.kill();
                     break;
                 }
                 match rx.recv_timeout(Duration::from_millis(40)) {
                     Ok(packet) => {
+                        let is_turn_end = matches!(&packet, LivePacket::AudioStreamEnd);
                         let message = match packet {
                             LivePacket::Audio(pcm) => json!({"audio": STANDARD.encode(pcm)}),
                             LivePacket::AudioStreamEnd => json!({"end": true}),
@@ -264,6 +322,15 @@ fn spawn_transcriber(
                         if write_line(&mut stdin, &message).is_err() {
                             let _ = child.kill();
                             break;
+                        }
+                        if is_turn_end
+                            && connected_at.elapsed() > Duration::from_secs(8 * 60)
+                            && graceful_rotation_deadline.is_none()
+                        {
+                            // Rotate at a natural silence boundary, then allow
+                            // the final transcript enough time to arrive.
+                            graceful_rotation_deadline =
+                                Some(Instant::now() + Duration::from_secs(2));
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -279,10 +346,35 @@ fn spawn_transcriber(
                                 "transcript",
                                 json!({"speaker":speaker,"text":text,"interim":interim}),
                             );
+                            if !interim && graceful_rotation_deadline.is_some() {
+                                let _ = child.kill();
+                                break 'session;
+                            }
+                        }
+                        BridgeEvent::Usage {
+                            input_tokens,
+                            output_tokens,
+                            total_tokens,
+                        } => {
+                            accumulated_input += input_tokens.saturating_sub(session_input);
+                            accumulated_output += output_tokens.saturating_sub(session_output);
+                            session_input = input_tokens;
+                            session_output = output_tokens;
+                            let _ = app.emit(
+                                "usage-update",
+                                json!({
+                                    "speaker": speaker,
+                                    "inputTokens": accumulated_input,
+                                    "outputTokens": accumulated_output,
+                                    "totalTokens": total_tokens
+                                }),
+                            );
                         }
                         BridgeEvent::Error(error) => {
-                            let _ = app
-                                .emit("transcription-error", json!({"speaker":speaker,"error":error}));
+                            let _ = app.emit(
+                                "transcription-error",
+                                json!({"speaker":speaker,"error":error}),
+                            );
                         }
                         BridgeEvent::ProcessEnded => {
                             let _ = child.kill();
@@ -300,18 +392,23 @@ fn wait_for_connected(events: &Receiver<BridgeEvent>, deadline: Instant) -> Resu
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err("Gemini did not confirm the Live session before the timeout".into());
+            return Err("Gemini no confirmó la sesión en vivo dentro del tiempo esperado".into());
         }
         match events.recv_timeout(remaining.min(Duration::from_millis(200))) {
             Ok(BridgeEvent::Connected) => return Ok(()),
             Ok(BridgeEvent::Error(error)) => return Err(error),
             Ok(BridgeEvent::ProcessEnded) => {
-                return Err("The Live bridge exited before confirming the session".into())
+                return Err(
+                    "El componente de transcripción terminó antes de confirmar la sesión".into(),
+                )
             }
             Ok(BridgeEvent::Transcript { .. }) => {}
+            Ok(BridgeEvent::Usage { .. }) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("The Live bridge exited before confirming the session".into())
+                return Err(
+                    "El componente de transcripción terminó antes de confirmar la sesión".into(),
+                )
             }
         }
     }
@@ -321,17 +418,17 @@ fn wait_for_connected(events: &Receiver<BridgeEvent>, deadline: Instant) -> Resu
 /// and waits for the "connected" confirmation (or a Gemini error) before
 /// killing it. Used by the health check to verify the Live path end-to-end
 /// without spawning a background transcriber thread.
-pub fn health_check(api_key: &str) -> Result<(), String> {
-    let child = spawn_bridge()?;
+pub fn health_check(app: &AppHandle, api_key: &str) -> Result<(), String> {
+    let child = spawn_bridge(app)?;
     let (mut child, events) = spawn_bridge_readers(child);
     let Some(mut stdin) = child.stdin.take() else {
         let _ = child.kill();
-        return Err("Could not open the Live bridge's stdin".into());
+        return Err("No se pudo abrir la entrada del componente de transcripción".into());
     };
     let init = json!({"api_key": api_key, "model": MODEL, "vocabulary": Vec::<String>::new()});
     if let Err(error) = write_line(&mut stdin, &init) {
         let _ = child.kill();
-        return Err(format!("Could not send the init message: {error}"));
+        return Err(format!("No se pudo iniciar la transcripción: {error}"));
     }
     let result = wait_for_connected(&events, Instant::now() + Duration::from_secs(25));
     let _ = child.kill();

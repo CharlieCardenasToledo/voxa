@@ -2,6 +2,19 @@
 //! Device capture stays platform-specific; these functions make the downstream contract stable.
 
 pub const TARGET_RATE: u32 = 16_000;
+pub const CHUNK_MS: usize = 100;
+pub const CHUNK_SAMPLES: usize = TARGET_RATE as usize * CHUNK_MS / 1_000;
+pub const CHUNK_BYTES: usize = CHUNK_SAMPLES * std::mem::size_of::<i16>();
+
+pub fn take_pcm_chunks(pending: &mut Vec<u8>, incoming: &[u8]) -> Vec<Vec<u8>> {
+    pending.extend_from_slice(incoming);
+    let mut chunks = Vec::new();
+    while pending.len() >= CHUNK_BYTES {
+        let remainder = pending.split_off(CHUNK_BYTES);
+        chunks.push(std::mem::replace(pending, remainder));
+    }
+    chunks
+}
 pub fn downmix(input: &[f32], channels: u16) -> Vec<f32> {
     let channel_count = channels.max(1) as usize;
     input
@@ -126,5 +139,15 @@ mod tests {
             assert_eq!(vad.observe(&silence), VadEvent::Silence);
         }
         assert_eq!(vad.observe(&silence), VadEvent::SpeechEnded);
+    }
+
+    #[test]
+    fn pcm_is_buffered_into_exact_100ms_chunks() {
+        let mut pending = Vec::new();
+        assert!(take_pcm_chunks(&mut pending, &vec![1; 960]).is_empty());
+        let chunks = take_pcm_chunks(&mut pending, &vec![2; CHUNK_BYTES * 2]);
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|chunk| chunk.len() == CHUNK_BYTES));
+        assert_eq!(pending.len(), 960);
     }
 }

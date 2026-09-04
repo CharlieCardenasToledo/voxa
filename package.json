@@ -9,8 +9,10 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:dev": "npm run build && npm run tauri -- dev",
-    "tauri:build": "npm run tauri -- build",
-    "check": "npm run build"
+    "sidecar:build": "powershell -NoProfile -ExecutionPolicy Bypass -File build-sidecar.ps1",
+    "tauri:build": "npm run sidecar:build && npm run tauri -- build",
+    "check": "npm run build",
+    "test:frontend": "vitest run"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.5.0",
@@ -25,6 +27,7 @@
     "@types/react-dom": "^18.3.5",
     "@vitejs/plugin-react": "^4.3.4",
     "typescript": "^5.7.2",
-    "vite": "^6.0.5"
+    "vite": "^6.0.5",
+    "vitest": "^5.0.0"
   }
 }

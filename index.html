@@ -1,10 +1,10 @@
 <!doctype html>
-<html lang="en">
+<html lang="es">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#0b1118" />
-    <title>Voxa — Presentation Copilot</title>
+    <title>Voxa — Copiloto de presentaciones</title>
   </head>
   <body>
     <div id="root"><div id="startup-status" style="min-height:100vh;display:grid;place-items:center;background:#0b1118;color:#b8c8ce;font:14px system-ui">Loading Voxa…</div></div>
@@ -15,7 +15,7 @@
       };
       window.addEventListener('error', event => showStartupError(event.message || event.error));
       window.addEventListener('unhandledrejection', event => showStartupError(event.reason));
-      setTimeout(() => { if (document.getElementById('startup-status')) showStartupError('React did not mount within 10 seconds. Check the terminal for Vite errors.'); }, 10000);
+      setTimeout(() => { if (document.getElementById('startup-status')) showStartupError('La interfaz no inició en 10 segundos. Revisa la terminal para ver los errores de Vite.'); }, 10000);
     </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>

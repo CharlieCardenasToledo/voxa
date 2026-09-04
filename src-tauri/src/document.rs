@@ -5,9 +5,15 @@ pub struct DocumentContext {
     pub text: String,
     pub vocabulary: Vec<String>,
     pub kind: String,
+    pub extraction_method: String,
+    pub ocr_used: bool,
+    pub warning: Option<String>,
+    pub model_used: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
-pub fn extract(file_name: &str, bytes: &[u8]) -> Result<DocumentContext, String> {
+pub fn extract_text(file_name: &str, bytes: &[u8]) -> Result<(String, String), String> {
     let extension = file_name
         .rsplit('.')
         .next()
@@ -16,31 +22,61 @@ pub fn extract(file_name: &str, bytes: &[u8]) -> Result<DocumentContext, String>
     let (text, kind) = match extension.as_str() {
         "pdf" => extract_pdf(bytes).map(|text| (text, "PDF".to_string()))?,
         "pptx" => extract_pptx(bytes).map(|text| (text, "PPTX".to_string()))?,
-        _ => return Err("Only PDF and PPTX files are supported".into()),
+        _ => return Err("Solo se admiten archivos PDF y PPTX".into()),
     };
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    Ok((text, kind))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn context_from_text(
+    text: String,
+    kind: String,
+    extraction_method: &str,
+    ocr_used: bool,
+    warning: Option<String>,
+    model_used: Option<String>,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> Result<DocumentContext, String> {
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if text.is_empty() {
-        return Err("The selected document contains no readable text".into());
+        return Err("El documento seleccionado no contiene texto legible".into());
     }
     Ok(DocumentContext {
         vocabulary: vocabulary(&text),
         text,
         kind,
+        extraction_method: extraction_method.to_string(),
+        ocr_used,
+        warning,
+        model_used,
+        input_tokens,
+        output_tokens,
     })
 }
 
+pub fn needs_pdf_ocr(file_name: &str, text: &str) -> bool {
+    file_name.to_ascii_lowercase().ends_with(".pdf")
+        && text
+            .chars()
+            .filter(|character| character.is_alphanumeric())
+            .count()
+            < 200
+}
+
 fn extract_pdf(bytes: &[u8]) -> Result<String, String> {
-    let document =
-        lopdf::Document::load_mem(bytes).map_err(|error| format!("Could not read PDF: {error}"))?;
+    let document = lopdf::Document::load_mem(bytes)
+        .map_err(|error| format!("No se pudo leer el PDF: {error}"))?;
     let pages = document.get_pages().keys().copied().collect::<Vec<_>>();
     document
         .extract_text(&pages)
-        .map_err(|error| format!("Could not extract PDF text: {error}"))
+        .map_err(|error| format!("No se pudo extraer el texto del PDF: {error}"))
 }
 
 fn extract_pptx(bytes: &[u8]) -> Result<String, String> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
-        .map_err(|error| format!("Could not read PPTX: {error}"))?;
+        .map_err(|error| format!("No se pudo leer el PPTX: {error}"))?;
     let mut slide_names = (1..=archive.len())
         .filter_map(|index| {
             archive
@@ -50,31 +86,74 @@ fn extract_pptx(bytes: &[u8]) -> Result<String, String> {
         })
         .filter(|name| name.starts_with("ppt/slides/slide") && name.ends_with(".xml"))
         .collect::<Vec<_>>();
-    slide_names.sort();
+    slide_names.sort_by_key(|name| {
+        name.rsplit('/')
+            .next()
+            .and_then(|file| file.strip_prefix("slide"))
+            .and_then(|file| file.strip_suffix(".xml"))
+            .and_then(|number| number.parse::<usize>().ok())
+            .unwrap_or(usize::MAX)
+    });
     let mut output = String::new();
     for name in slide_names {
         let mut file = archive.by_name(&name).map_err(|error| error.to_string())?;
         let mut xml = String::new();
         file.read_to_string(&mut xml)
-            .map_err(|error| format!("Could not read slide XML: {error}"))?;
-        let mut reader = quick_xml::Reader::from_str(&xml);
-        let mut buffer = Vec::new();
-        loop {
-            match reader.read_event_into(&mut buffer) {
-                Ok(quick_xml::events::Event::Text(text)) => {
-                    let decoded = text.decode().map_err(|error| error.to_string())?;
-                    output.push_str(
-                        &quick_xml::escape::unescape(&decoded)
-                            .map_err(|error| error.to_string())?,
-                    );
-                }
-                Ok(quick_xml::events::Event::Eof) => break,
-                Ok(_) => {}
-                Err(error) => return Err(format!("Could not parse slide XML: {error}")),
-            }
-            buffer.clear();
-        }
+            .map_err(|error| format!("No se pudo leer el contenido de la diapositiva: {error}"))?;
+        output.push_str(&extract_xml_text(&xml, "slide XML")?);
         output.push('\n');
+    }
+    let mut note_names = (1..=archive.len())
+        .filter_map(|index| {
+            archive
+                .by_index(index)
+                .ok()
+                .map(|file| file.name().to_string())
+        })
+        .filter(|name| name.starts_with("ppt/notesSlides/notesSlide") && name.ends_with(".xml"))
+        .collect::<Vec<_>>();
+    note_names.sort_by_key(|name| {
+        name.rsplit('/')
+            .next()
+            .and_then(|file| file.strip_prefix("notesSlide"))
+            .and_then(|file| file.strip_suffix(".xml"))
+            .and_then(|number| number.parse::<usize>().ok())
+            .unwrap_or(usize::MAX)
+    });
+    for name in note_names {
+        let mut file = archive.by_name(&name).map_err(|error| error.to_string())?;
+        let mut xml = String::new();
+        file.read_to_string(&mut xml)
+            .map_err(|error| format!("No se pudieron leer las notas de la diapositiva: {error}"))?;
+        let notes = extract_xml_text(&xml, "notes XML")?;
+        if !notes.trim().is_empty() {
+            output.push_str(" Speaker notes: ");
+            output.push_str(&notes);
+            output.push('\n');
+        }
+    }
+    Ok(output)
+}
+
+fn extract_xml_text(xml: &str, source: &str) -> Result<String, String> {
+    let mut output = String::new();
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut buffer = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(quick_xml::events::Event::Text(text)) => {
+                let decoded = text.decode().map_err(|error| error.to_string())?;
+                output.push_str(
+                    &quick_xml::escape::unescape(&decoded)
+                        .map_err(|error| format!("Could not decode {source}: {error}"))?,
+                );
+                output.push(' ');
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => return Err(format!("Could not parse {source}: {error}")),
+        }
+        buffer.clear();
     }
     Ok(output)
 }
@@ -107,12 +186,20 @@ fn vocabulary(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::vocabulary;
+    use super::{needs_pdf_ocr, vocabulary};
 
     #[test]
     fn extracts_technical_terms() {
         let terms = vocabulary("Kubernetes PostgreSQL api v2 OpenTelemetry");
         assert!(terms.iter().any(|term| term == "Kubernetes"));
         assert!(terms.iter().any(|term| term == "v2"));
+    }
+
+    #[test]
+    fn requests_ocr_only_for_sparse_pdfs() {
+        assert!(needs_pdf_ocr("scan.pdf", ""));
+        assert!(needs_pdf_ocr("scan.PDF", "Short scanned title"));
+        assert!(!needs_pdf_ocr("slides.pptx", ""));
+        assert!(!needs_pdf_ocr("digital.pdf", &"readable text ".repeat(30)));
     }
 }

@@ -8,7 +8,7 @@ Aplicación local de escritorio para Windows basada en Tauri 2, React y Rust.
 - Rust stable `x86_64-pc-windows-msvc`.
 - Visual Studio Build Tools con C++.
 - Node.js 20+.
-- Python 3.10+ en el `PATH` (como `python`), con `pip install google-genai`. La transcripción en vivo la maneja un sidecar de Python (`src-tauri/python/live_bridge.py`) que usa el SDK oficial de Google — ver "Por qué Python" más abajo. Si tu intérprete no se llama `python`, define `VOXA_PYTHON` con la ruta completa.
+- Python 3.10+ en el `PATH` (como `python`), con `pip install google-genai`, para desarrollo. El instalador de producción incluye el puente compilado, por lo que no exige Python al usuario final.
 
 ## Levantar Tauri localmente
 
@@ -25,11 +25,13 @@ El comando compila el frontend y Tauri lo carga directamente desde `dist`, sin d
 npm run check
 ```
 
-Para generar el bundle local:
+Para generar el instalador Windows:
 
 ```powershell
 npm run tauri:build
 ```
+
+`tauri:build` compila primero `voxa-live-bridge.exe` con PyInstaller y después genera el instalador NSIS en `src-tauri/target/release/bundle/nsis/`.
 
 ## Gemini
 

@@ -2,10 +2,12 @@ import { create } from 'zustand';
 
 export type Screen = 'prepare' | 'practice' | 'live';
 export type LiveState = 'idle' | 'them-speaking' | 'them-finished' | 'generating' | 'answer-ready' | 'me-speaking';
-export type Turn = { speaker: 'ME' | 'THEM'; text: string; time: string };
+export type Turn = { id: string; speaker: 'ME' | 'THEM'; text: string; translation?: string; sourceLanguage?: string; translating?: boolean; time: string };
 export type CopilotAnswer = { questionEn: string; questionEs: string; answer: string; more: string; idea: string; confidence: 'HIGH' | 'MEDIUM' | 'LOW'; warning?: string };
+export type PracticeItem = { question: string; answer: string };
 export type CapturePhase = 'starting' | 'listening' | 'paused' | 'error' | 'stopped';
 export type AudioSourceState = { level: number; active: boolean; device: string; transcription: 'offline' | 'connecting' | 'connected' | 'error'; error?: string };
+export type TokenUsage = { inputTokens: number; outputTokens: number };
 
 const demoAnswer: CopilotAnswer = {
   questionEn: 'Why did you choose this architecture instead of microservices?',
@@ -17,33 +19,40 @@ const demoAnswer: CopilotAnswer = {
 };
 
 type Store = {
-  screen: Screen; sessionTitle: string; sessionId: string | null; liveState: LiveState; paused: boolean; answer: CopilotAnswer | null; turns: Turn[]; prepared: boolean; capturePhase: CapturePhase; captureError: string | null; audioSources: Record<'ME' | 'THEM', AudioSourceState>;
+  screen: Screen; sessionTitle: string; sessionId: string | null; practiceQuestions: PracticeItem[]; liveState: LiveState; paused: boolean; answer: CopilotAnswer | null; answerLoading: boolean; answerError: string | null; activeQuestion: string | null; questionQueue: string[]; answerCostUsd: number; liveUsage: Record<'ME' | 'THEM', TokenUsage>; turns: Turn[]; interimTranscripts: Record<'ME' | 'THEM', string>; prepared: boolean; capturePhase: CapturePhase; captureError: string | null; audioSources: Record<'ME' | 'THEM', AudioSourceState>;
   setScreen: (screen: Screen) => void; setSessionTitle: (title: string) => void; setSessionId: (id: string) => void; prepare: (title: string) => void; startLive: (demo?: boolean) => void; endLive: () => void; setPaused: (paused: boolean) => void;
-  addTurn: (turn: Turn) => void; setAnswer: (answer: CopilotAnswer) => void; clearLiveDemo: () => void; cycleAnswer: (kind: 'shorter' | 'more' | 'alternative') => void; setCapture: (phase: CapturePhase, error?: string | null) => void; setAudioSource: (speaker: 'ME' | 'THEM', patch: Partial<AudioSourceState>) => void;
+  addTurn: (turn: Turn) => void; updateTurn: (id: string, patch: Partial<Turn>) => void; setTurns: (turns: Turn[]) => void; setPracticeQuestions: (questions: PracticeItem[]) => void; setInterimTranscript: (speaker: 'ME' | 'THEM', text: string) => void; setAnswer: (answer: CopilotAnswer) => void; setAnswerText: (answer: string) => void; setAnswerLoading: (loading: boolean) => void; setAnswerError: (error: string | null) => void; setActiveQuestion: (question: string | null) => void; enqueueQuestion: (question: string) => void; removeFirstQueuedQuestion: () => void; removeQueuedQuestion: (question: string) => void; addAnswerCost: (cost: number) => void; setLiveUsage: (speaker: 'ME' | 'THEM', usage: TokenUsage) => void; clearLiveDemo: () => void; setCapture: (phase: CapturePhase, error?: string | null) => void; setAudioSource: (speaker: 'ME' | 'THEM', patch: Partial<AudioSourceState>) => void;
 };
 
 export const useStore = create<Store>((set) => ({
-  screen: 'prepare', sessionTitle: 'Technical Architecture Presentation', sessionId: null, liveState: 'idle', paused: false, answer: null, turns: [], prepared: false, capturePhase: 'stopped', captureError: null,
+  screen: 'prepare', sessionTitle: 'Presentación de arquitectura técnica', sessionId: null, practiceQuestions: [], liveState: 'idle', paused: false, answer: null, answerLoading: false, answerError: null, activeQuestion: null, questionQueue: [], answerCostUsd: 0, liveUsage: { ME: { inputTokens: 0, outputTokens: 0 }, THEM: { inputTokens: 0, outputTokens: 0 } }, turns: [], interimTranscripts: { ME: '', THEM: '' }, prepared: false, capturePhase: 'stopped', captureError: null,
   audioSources: {
-    ME: { level: 0, active: false, device: 'Default microphone', transcription: 'offline' },
-    THEM: { level: 0, active: false, device: 'Default system output', transcription: 'offline' },
+    ME: { level: 0, active: false, device: 'Micrófono predeterminado', transcription: 'offline' },
+    THEM: { level: 0, active: false, device: 'Salida de audio predeterminada', transcription: 'offline' },
   },
   setScreen: (screen) => set({ screen }),
   setSessionTitle: (sessionTitle) => set({ sessionTitle }),
   setSessionId: (sessionId) => set({ sessionId }),
   prepare: (sessionTitle) => set({ sessionTitle, prepared: true, screen: 'practice' }),
-  startLive: (demo = true) => set(demo ? { screen: 'live', liveState: 'them-speaking', paused: false, answer: demoAnswer, turns: [{ speaker: 'ME', text: 'Today I am going to explain the architecture we selected for the project.', time: '09:41' }, { speaker: 'THEM', text: demoAnswer.questionEn, time: '09:42' }] } : { screen: 'live', liveState: 'them-speaking', paused: false, answer: null, turns: [] }),
+  startLive: (demo = true) => set(demo ? { screen: 'live', liveState: 'them-speaking', paused: false, answer: demoAnswer, answerLoading: false, answerError: null, activeQuestion: demoAnswer.questionEn, questionQueue: [], answerCostUsd: 0, liveUsage: { ME: { inputTokens: 0, outputTokens: 0 }, THEM: { inputTokens: 0, outputTokens: 0 } }, turns: [{ id: 'demo-me', speaker: 'ME', text: 'Today I am going to explain the architecture we selected for the project.', translation: 'Hoy explicaré la arquitectura que seleccionamos para el proyecto.', time: '09:41' }, { id: 'demo-them', speaker: 'THEM', text: demoAnswer.questionEn, translation: demoAnswer.questionEs, time: '09:42' }], interimTranscripts: { ME: '', THEM: '' } } : { screen: 'live', liveState: 'them-speaking', paused: false, answer: null, answerLoading: false, answerError: null, activeQuestion: null, questionQueue: [], answerCostUsd: 0, liveUsage: { ME: { inputTokens: 0, outputTokens: 0 }, THEM: { inputTokens: 0, outputTokens: 0 } }, turns: [], interimTranscripts: { ME: '', THEM: '' } }),
   endLive: () => set({ screen: 'practice', liveState: 'idle', paused: false }),
   setPaused: (paused) => set({ paused, liveState: paused ? 'idle' : 'them-speaking' }),
-  addTurn: (turn) => set((state) => ({ turns: [...state.turns, turn] })),
+  addTurn: (turn) => set((state) => ({ turns: [...state.turns, turn].slice(-200) })),
+  updateTurn: (id, patch) => set((state) => ({ turns: state.turns.map(turn => turn.id === id ? { ...turn, ...patch } : turn) })),
+  setTurns: (turns) => set({ turns: turns.slice(-200) }),
+  setPracticeQuestions: (practiceQuestions) => set({ practiceQuestions }),
+  setInterimTranscript: (speaker, text) => set((state) => ({ interimTranscripts: { ...state.interimTranscripts, [speaker]: text } })),
   setAnswer: (answer) => set({ answer, liveState: 'answer-ready' }),
-  clearLiveDemo: () => set({ answer: null, turns: [], liveState: 'them-speaking' }),
+  setAnswerText: (answer) => set((state) => state.answer ? { answer: { ...state.answer, answer } } : state),
+  setAnswerLoading: (answerLoading) => set({ answerLoading }),
+  setAnswerError: (answerError) => set({ answerError }),
+  setActiveQuestion: (activeQuestion) => set({ activeQuestion }),
+  enqueueQuestion: (question) => set((state) => state.questionQueue.some(item => item.toLocaleLowerCase() === question.toLocaleLowerCase()) ? state : { questionQueue: [...state.questionQueue, question].slice(-20) }),
+  removeFirstQueuedQuestion: () => set((state) => ({ questionQueue: state.questionQueue.slice(1) })),
+  removeQueuedQuestion: (question) => set((state) => ({ questionQueue: state.questionQueue.filter(item => item !== question) })),
+  addAnswerCost: (cost) => set((state) => ({ answerCostUsd: state.answerCostUsd + cost })),
+  setLiveUsage: (speaker, usage) => set((state) => ({ liveUsage: { ...state.liveUsage, [speaker]: usage } })),
+  clearLiveDemo: () => set({ answer: null, answerLoading: false, answerError: null, activeQuestion: null, questionQueue: [], answerCostUsd: 0, liveUsage: { ME: { inputTokens: 0, outputTokens: 0 }, THEM: { inputTokens: 0, outputTokens: 0 } }, turns: [], interimTranscripts: { ME: '', THEM: '' }, liveState: 'them-speaking' }),
   setCapture: (capturePhase, captureError = null) => set({ capturePhase, captureError }),
   setAudioSource: (speaker, patch) => set((state) => ({ audioSources: { ...state.audioSources, [speaker]: { ...state.audioSources[speaker], ...patch } } })),
-  cycleAnswer: (kind) => set((state) => {
-    if (!state.answer) return state;
-    if (kind === 'more') return { answer: { ...state.answer, answer: `${state.answer.answer} ${state.answer.more}` } };
-    if (kind === 'shorter') return { answer: { ...state.answer, answer: 'We chose it because it is simpler to develop and maintain at our current scale.' } };
-    return { answer: { ...state.answer, answer: 'Our choice keeps the system simple now, while leaving room to split components as the application grows.' } };
-  })
 }));

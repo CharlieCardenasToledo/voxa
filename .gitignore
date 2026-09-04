@@ -12,6 +12,7 @@ target5/
 target6/
 src-tauri/target/
 src-tauri/gen/
+src-tauri/.pyinstaller/
 *.exe
 *.pdb
 

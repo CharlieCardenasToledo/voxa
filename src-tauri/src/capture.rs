@@ -3,7 +3,8 @@ use cpal::Sample;
 use std::sync::{Arc, Mutex};
 
 use crate::audio::{
-    downmix, resample_linear, to_pcm16, VadEvent, VoiceActivityDetector, TARGET_RATE,
+    downmix, resample_linear, take_pcm_chunks, to_pcm16, VadEvent, VoiceActivityDetector,
+    CHUNK_BYTES, TARGET_RATE,
 };
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -42,12 +43,12 @@ impl AudioCapture {
             .unwrap_or_else(|_| "Default system output".into());
         let mic_config = microphone
             .default_input_config()
-            .map_err(|e| format!("Microphone config: {e}"))?;
+            .map_err(|e| format!("Configuración del micrófono: {e}"))?;
         // CPAL's WASAPI backend enables loopback when an output device is opened
         // as an input stream. Its native mix format comes from the output config.
         let loop_config = output
             .default_output_config()
-            .map_err(|e| format!("WASAPI loopback config: {e}"))?;
+            .map_err(|e| format!("Configuración del audio del computador: {e}"))?;
         let mic_rate = mic_config.sample_rate().0;
         let mic_channels = mic_config.channels();
         let mic_callback = Arc::new(on_chunk);
@@ -67,10 +68,11 @@ impl AudioCapture {
             loop_config.sample_rate().0,
             move |samples, ended| (loop_callback)("THEM", samples, ended),
         )?;
-        mic.play().map_err(|e| format!("Start microphone: {e}"))?;
+        mic.play()
+            .map_err(|e| format!("No se pudo iniciar el micrófono: {e}"))?;
         loopback
             .play()
-            .map_err(|e| format!("Start loopback: {e}"))?;
+            .map_err(|e| format!("No se pudo iniciar el audio del computador: {e}"))?;
         Ok(Self {
             _mic: mic,
             _loopback: loopback,
@@ -81,6 +83,19 @@ impl AudioCapture {
 
     pub fn device_names(&self) -> (String, String) {
         (self.microphone_name.clone(), self.loopback_name.clone())
+    }
+
+    pub fn set_source_enabled(&self, speaker: &str, enabled: bool) -> Result<(), String> {
+        let stream = match speaker {
+            "ME" => &self._mic,
+            "THEM" => &self._loopback,
+            _ => return Err("Fuente de audio desconocida".into()),
+        };
+        if enabled {
+            stream.play().map_err(|error| error.to_string())
+        } else {
+            stream.pause().map_err(|error| error.to_string())
+        }
     }
 }
 
@@ -106,7 +121,7 @@ where
         cpal::SampleFormat::U16 => {
             build::<u16, _>(&device, &stream_config, channels, rate, callback, err)
         }
-        format => Err(format!("Unsupported sample format: {format:?}")),
+        format => Err(format!("Formato de audio no compatible: {format:?}")),
     }
 }
 
@@ -124,6 +139,7 @@ where
 {
     let vad = Arc::new(Mutex::new(VoiceActivityDetector::default()));
     let vad_clone = Arc::clone(&vad);
+    let mut pending = Vec::with_capacity(CHUNK_BYTES * 2);
     let stream = device
         .build_input_stream(
             config,
@@ -138,11 +154,13 @@ where
                     samples
                 };
                 let pcm = to_pcm16(&resample_linear(&mono, rate, TARGET_RATE));
-                let ended = vad_clone
-                    .lock()
-                    .map(|mut detector| detector.observe(&pcm) == VadEvent::SpeechEnded)
-                    .unwrap_or(false);
-                callback(pcm, ended);
+                for chunk in take_pcm_chunks(&mut pending, &pcm) {
+                    let ended = vad_clone
+                        .lock()
+                        .map(|mut detector| detector.observe(&chunk) == VadEvent::SpeechEnded)
+                        .unwrap_or(false);
+                    callback(chunk, ended);
+                }
             },
             err,
             Some(std::time::Duration::from_millis(100)),
@@ -165,4 +183,13 @@ pub fn default_status() -> CaptureStatus {
     }
 }
 
-pub type CaptureStop = std::sync::mpsc::Sender<()>;
+pub enum CaptureCommand {
+    Stop,
+    SetSource {
+        speaker: String,
+        enabled: bool,
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+}
+
+pub type CaptureControl = std::sync::mpsc::Sender<CaptureCommand>;

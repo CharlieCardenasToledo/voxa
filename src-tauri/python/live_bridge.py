@@ -60,7 +60,8 @@ def start_stdin_reader(audio_q: "queue.Queue[tuple[str, bytes | None]]") -> None
                 audio_q.put(("audio", base64.b64decode(msg["audio"])))
             elif msg.get("end"):
                 audio_q.put(("end", None))
-                return
+                # This marks an utterance boundary, not the end of the Live
+                # session. Keep reading so later questions are transcribed.
         # stdin closed (parent stopped us): treat like an end signal.
         audio_q.put(("end", None))
 
@@ -94,11 +95,19 @@ async def run_session(init: dict, audio_q: "queue.Queue[tuple[str, bytes | None]
                     )
                 elif kind == "end":
                     await session.send_realtime_input(audio_stream_end=True)
-                    return
 
         sender_task = asyncio.create_task(sender())
         try:
             async for response in session.receive():
+                usage = getattr(response, "usage_metadata", None)
+                if usage is not None:
+                    emit({
+                        "usage": {
+                            "input_tokens": getattr(usage, "prompt_token_count", 0) or 0,
+                            "output_tokens": getattr(usage, "response_token_count", 0) or 0,
+                            "total_tokens": getattr(usage, "total_token_count", 0) or 0,
+                        }
+                    })
                 content = getattr(response, "server_content", None)
                 if content is None:
                     continue
