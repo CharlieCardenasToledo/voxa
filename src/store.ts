@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 
-export type Screen = 'prepare' | 'practice' | 'live';
+export type Screen = 'prepare' | 'practice' | 'live' | 'settings';
+export type SessionMode = 'class' | 'presentation' | 'reunion';
 export type LiveState = 'idle' | 'them-speaking' | 'them-finished' | 'generating' | 'answer-ready' | 'me-speaking';
 export type Turn = { id: string; speaker: 'ME' | 'THEM'; text: string; translation?: string; sourceLanguage?: string; translating?: boolean; time: string };
 export type CopilotAnswer = { questionEn: string; questionEs: string; answer: string; more: string; idea: string; confidence: 'HIGH' | 'MEDIUM' | 'LOW'; warning?: string };
@@ -8,6 +9,8 @@ export type PracticeItem = { question: string; answer: string };
 export type CapturePhase = 'starting' | 'listening' | 'paused' | 'error' | 'stopped';
 export type AudioSourceState = { level: number; active: boolean; device: string; transcription: 'offline' | 'connecting' | 'connected' | 'error'; error?: string };
 export type TokenUsage = { inputTokens: number; outputTokens: number };
+export type SlideScriptEntry = { scriptEn: string; pronunciation: string; scriptEs: string };
+export type PresentationPhase = 'intro' | 'slides' | 'outro';
 
 const demoAnswer: CopilotAnswer = {
   questionEn: 'Why did you choose this architecture instead of microservices?',
@@ -20,8 +23,10 @@ const demoAnswer: CopilotAnswer = {
 
 type Store = {
   screen: Screen; sessionTitle: string; sessionId: string | null; practiceQuestions: PracticeItem[]; liveState: LiveState; paused: boolean; answer: CopilotAnswer | null; answerLoading: boolean; answerError: string | null; activeQuestion: string | null; questionQueue: string[]; answerCostUsd: number; liveUsage: Record<'ME' | 'THEM', TokenUsage>; turns: Turn[]; interimTranscripts: Record<'ME' | 'THEM', string>; prepared: boolean; capturePhase: CapturePhase; captureError: string | null; audioSources: Record<'ME' | 'THEM', AudioSourceState>;
+  sessionMode: SessionMode; slidePages: string[]; slideScripts: SlideScriptEntry[]; introScript: SlideScriptEntry | null; outroScript: SlideScriptEntry | null; currentSlideIndex: number; presentationPhase: PresentationPhase; presentationFinished: boolean;
   setScreen: (screen: Screen) => void; setSessionTitle: (title: string) => void; setSessionId: (id: string) => void; prepare: (title: string) => void; startLive: (demo?: boolean) => void; endLive: () => void; setPaused: (paused: boolean) => void;
   addTurn: (turn: Turn) => void; updateTurn: (id: string, patch: Partial<Turn>) => void; setTurns: (turns: Turn[]) => void; setPracticeQuestions: (questions: PracticeItem[]) => void; setInterimTranscript: (speaker: 'ME' | 'THEM', text: string) => void; setAnswer: (answer: CopilotAnswer) => void; setAnswerText: (answer: string) => void; setAnswerLoading: (loading: boolean) => void; setAnswerError: (error: string | null) => void; setActiveQuestion: (question: string | null) => void; enqueueQuestion: (question: string) => void; removeFirstQueuedQuestion: () => void; removeQueuedQuestion: (question: string) => void; addAnswerCost: (cost: number) => void; setLiveUsage: (speaker: 'ME' | 'THEM', usage: TokenUsage) => void; clearLiveDemo: () => void; setCapture: (phase: CapturePhase, error?: string | null) => void; setAudioSource: (speaker: 'ME' | 'THEM', patch: Partial<AudioSourceState>) => void;
+  setSessionMode: (mode: SessionMode) => void; setSlideDeck: (pages: string[], scripts: SlideScriptEntry[], intro: SlideScriptEntry | null, outro: SlideScriptEntry | null) => void; setCurrentSlideIndex: (index: number) => void; setPresentationFinished: (finished: boolean) => void; setPresentationPhase: (phase: PresentationPhase) => void;
 };
 
 export const useStore = create<Store>((set) => ({
@@ -30,12 +35,13 @@ export const useStore = create<Store>((set) => ({
     ME: { level: 0, active: false, device: 'Micrófono predeterminado', transcription: 'offline' },
     THEM: { level: 0, active: false, device: 'Salida de audio predeterminada', transcription: 'offline' },
   },
+  sessionMode: 'class', slidePages: [], slideScripts: [], introScript: null, outroScript: null, currentSlideIndex: 0, presentationPhase: 'intro', presentationFinished: false,
   setScreen: (screen) => set({ screen }),
   setSessionTitle: (sessionTitle) => set({ sessionTitle }),
   setSessionId: (sessionId) => set({ sessionId }),
   prepare: (sessionTitle) => set({ sessionTitle, prepared: true, screen: 'practice' }),
   startLive: (demo = true) => set(demo ? { screen: 'live', liveState: 'them-speaking', paused: false, answer: demoAnswer, answerLoading: false, answerError: null, activeQuestion: demoAnswer.questionEn, questionQueue: [], answerCostUsd: 0, liveUsage: { ME: { inputTokens: 0, outputTokens: 0 }, THEM: { inputTokens: 0, outputTokens: 0 } }, turns: [{ id: 'demo-me', speaker: 'ME', text: 'Today I am going to explain the architecture we selected for the project.', translation: 'Hoy explicaré la arquitectura que seleccionamos para el proyecto.', time: '09:41' }, { id: 'demo-them', speaker: 'THEM', text: demoAnswer.questionEn, translation: demoAnswer.questionEs, time: '09:42' }], interimTranscripts: { ME: '', THEM: '' } } : { screen: 'live', liveState: 'them-speaking', paused: false, answer: null, answerLoading: false, answerError: null, activeQuestion: null, questionQueue: [], answerCostUsd: 0, liveUsage: { ME: { inputTokens: 0, outputTokens: 0 }, THEM: { inputTokens: 0, outputTokens: 0 } }, turns: [], interimTranscripts: { ME: '', THEM: '' } }),
-  endLive: () => set({ screen: 'practice', liveState: 'idle', paused: false }),
+  endLive: () => set({ screen: 'practice', liveState: 'idle', paused: false, presentationFinished: false }),
   setPaused: (paused) => set({ paused, liveState: paused ? 'idle' : 'them-speaking' }),
   addTurn: (turn) => set((state) => ({ turns: [...state.turns, turn].slice(-200) })),
   updateTurn: (id, patch) => set((state) => ({ turns: state.turns.map(turn => turn.id === id ? { ...turn, ...patch } : turn) })),
@@ -55,4 +61,9 @@ export const useStore = create<Store>((set) => ({
   clearLiveDemo: () => set({ answer: null, answerLoading: false, answerError: null, activeQuestion: null, questionQueue: [], answerCostUsd: 0, liveUsage: { ME: { inputTokens: 0, outputTokens: 0 }, THEM: { inputTokens: 0, outputTokens: 0 } }, turns: [], interimTranscripts: { ME: '', THEM: '' }, liveState: 'them-speaking' }),
   setCapture: (capturePhase, captureError = null) => set({ capturePhase, captureError }),
   setAudioSource: (speaker, patch) => set((state) => ({ audioSources: { ...state.audioSources, [speaker]: { ...state.audioSources[speaker], ...patch } } })),
+  setSessionMode: (sessionMode) => set({ sessionMode }),
+  setSlideDeck: (slidePages, slideScripts, introScript, outroScript) => set({ slidePages, slideScripts, introScript, outroScript, currentSlideIndex: 0, presentationPhase: 'intro', presentationFinished: false }),
+  setCurrentSlideIndex: (index) => set((state) => ({ currentSlideIndex: Math.max(0, Math.min(index, Math.max(state.slidePages.length - 1, 0))) })),
+  setPresentationFinished: (presentationFinished) => set({ presentationFinished }),
+  setPresentationPhase: (presentationPhase) => set({ presentationPhase }),
 }));

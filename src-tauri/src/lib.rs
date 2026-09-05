@@ -3,7 +3,7 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::{fs, time::Duration};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 mod audio;
 mod capture;
 mod document;
@@ -17,6 +17,7 @@ struct RuntimeState {
     knowledge_context: std::sync::Mutex<Option<String>>,
     session_context: std::sync::Mutex<Option<String>>,
     vocabulary_context: std::sync::Mutex<Vec<String>>,
+    presentation_pdf: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
 const KEYRING_SERVICE: &str = "voxa-presentation-copilot";
@@ -43,6 +44,16 @@ struct SessionRecord {
     vocabulary: Vec<String>,
     #[serde(default)]
     questions: Vec<PracticeQuestion>,
+    #[serde(default)]
+    session_mode: String,
+    #[serde(default)]
+    slide_pages: Vec<String>,
+    #[serde(default)]
+    slide_scripts: Vec<SlideScript>,
+    #[serde(default)]
+    intro_script: Option<ScriptBlock>,
+    #[serde(default)]
+    outro_script: Option<ScriptBlock>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -57,6 +68,17 @@ struct PrepareRequest {
     forbidden_claims: String,
     context: String,
     vocabulary: String,
+    #[serde(default)]
+    session_mode: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct UserProfile {
+    name: String,
+    professional_context: String,
+    #[serde(default)]
+    vocabulary: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -186,14 +208,24 @@ fn prepare_session(
     if request.title.trim().is_empty() {
         return Err("Debes escribir un nombre para la sesión".into());
     }
+    let profile = read_user_profile_file(&app).ok().flatten().unwrap_or_default();
     let document = state
         .knowledge_context
         .lock()
         .map_err(|_| "Document state is unavailable".to_string())?
         .clone()
         .unwrap_or_default();
+    let identity = if profile.name.trim().is_empty() && profile.professional_context.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "PRESENTER NAME: {}\nPRESENTER BACKGROUND: {}\n",
+            profile.name.trim(),
+            profile.professional_context.trim()
+        )
+    };
     let context = format!(
-        "TITLE: {}\nPRESENTER ROLE: {}\nAUDIENCE: {}\nENGLISH LEVEL: {}\nRESPONSE LENGTH: {}\nIMPORTANT FACTS:\n{}\nFORBIDDEN CLAIMS:\n{}\nPROJECT CONTEXT:\n{}\nVOCABULARY:\n{}\nPRESENTATION:\n{}",
+        "{identity}TITLE: {}\nPRESENTER ROLE: {}\nAUDIENCE: {}\nENGLISH LEVEL: {}\nRESPONSE LENGTH: {}\nIMPORTANT FACTS:\n{}\nFORBIDDEN CLAIMS:\n{}\nPROJECT CONTEXT:\n{}\nVOCABULARY:\n{}\nPRESENTATION:\n{}",
         request.title.trim(),
         request.role.trim(),
         request.audience.trim(),
@@ -213,6 +245,22 @@ fn prepare_session(
         .interaction_id
         .lock()
         .map_err(|_| "Conversation state is unavailable".to_string())? = None;
+
+    {
+        let mut vocabulary = state
+            .vocabulary_context
+            .lock()
+            .map_err(|_| "Vocabulary state is unavailable".to_string())?;
+        for term in &profile.vocabulary {
+            if !vocabulary
+                .iter()
+                .any(|item: &String| item.eq_ignore_ascii_case(term))
+                && vocabulary.len() < 100
+            {
+                vocabulary.push(term.clone());
+            }
+        }
+    }
 
     if !request.vocabulary.trim().is_empty() {
         let mut vocabulary = state
@@ -244,7 +292,14 @@ fn prepare_session(
             .unwrap_or_default()
             .as_secs()
     );
-    let questions = generate_practice_questions(&context)?;
+    let questions = if request.session_mode == "reunion" {
+        // Reunión mode is "I'm not presenting anything" - there is nothing
+        // to rehearse, so skip the Gemini call entirely rather than
+        // generating practice questions nobody will see.
+        Vec::new()
+    } else {
+        generate_practice_questions(&app, &context)?
+    };
     let stored_vocabulary = state
         .vocabulary_context
         .lock()
@@ -264,6 +319,11 @@ fn prepare_session(
             response_length: request.response_length,
             vocabulary: stored_vocabulary,
             questions: questions.clone(),
+            session_mode: request.session_mode,
+            slide_pages: Vec::new(),
+            slide_scripts: Vec::new(),
+            intro_script: None,
+            outro_script: None,
         },
     )?;
     Ok(PreparedSession { id, questions })
@@ -271,6 +331,7 @@ fn prepare_session(
 
 #[tauri::command]
 fn extract_document(
+    app: AppHandle,
     file_name: String,
     bytes: Vec<u8>,
     state: State<'_, RuntimeState>,
@@ -280,8 +341,8 @@ fn extract_document(
     }
     let local_result = document::extract_text(&file_name, &bytes);
     let context = match local_result {
-        Ok((local_text, kind)) if document::needs_pdf_ocr(&file_name, &local_text) => {
-            match extract_pdf_with_gemini(&bytes) {
+        Ok((local_text, kind, _pages)) if document::needs_pdf_ocr(&file_name, &local_text) => {
+            match extract_pdf_with_gemini(&app, &bytes) {
                 Ok(context) => context,
                 Err(ocr_error) if !local_text.trim().is_empty() => document::context_from_text(
                     local_text,
@@ -292,6 +353,7 @@ fn extract_document(
                     None,
                     0,
                     0,
+                    None,
                 )?,
                 Err(ocr_error) => {
                     return Err(format!(
@@ -300,7 +362,7 @@ fn extract_document(
                 }
             }
         }
-        Ok((local_text, kind)) if local_text.trim().is_empty() => {
+        Ok((local_text, kind, _pages)) if local_text.trim().is_empty() => {
             return Err(if kind == "PPTX" {
                 "Este PowerPoint no contiene texto legible. Expórtalo como PDF para que Gemini pueda leer visualmente las diapositivas."
                     .into()
@@ -308,11 +370,11 @@ fn extract_document(
                 "El documento seleccionado no contiene texto legible".into()
             });
         }
-        Ok((local_text, kind)) => {
-            document::context_from_text(local_text, kind, "local", false, None, None, 0, 0)?
+        Ok((local_text, kind, pages)) => {
+            document::context_from_text(local_text, kind, "local", false, None, None, 0, 0, pages)?
         }
         Err(local_error) if file_name.to_ascii_lowercase().ends_with(".pdf") => {
-            extract_pdf_with_gemini(&bytes).map_err(|ocr_error| {
+            extract_pdf_with_gemini(&app, &bytes).map_err(|ocr_error| {
                 format!(
                     "No se pudo leer el PDF localmente ({local_error}) ni con el OCR de Gemini ({ocr_error})"
                 )
@@ -328,6 +390,7 @@ fn extract_document(
         .vocabulary_context
         .lock()
         .map_err(|_| "Document state is unavailable".to_string())? = context.vocabulary.clone();
+    let _ = merge_profile_vocabulary(&app, &context.vocabulary);
     Ok(context)
 }
 
@@ -393,35 +456,66 @@ fn start_audio_capture(
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<capture::CaptureCommand>();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(String, String), String>>();
     std::thread::spawn(move || {
-        let engine = capture::AudioCapture::start(move |speaker, pcm, ended| {
-            if let Some(hub) = &hub_for_callback {
-                hub.push(speaker, pcm.clone(), ended);
-            }
-            let (rms, peak) = audio_level(&pcm);
-            let _ = handle.emit("audio-level", serde_json::json!({"speaker": speaker, "rms": rms, "peak": peak, "active": rms >= 0.012}));
-        });
-        match engine {
-            Ok(engine) => {
-                let names = engine.device_names();
-                let _ = ready_tx.send(Ok(names));
-                while let Ok(command) = stop_rx.recv() {
-                    match command {
-                        capture::CaptureCommand::Stop => break,
-                        capture::CaptureCommand::SetSource {
-                            speaker,
-                            enabled,
-                            reply,
-                        } => {
-                            let _ = reply.send(engine.set_source_enabled(&speaker, enabled));
-                        }
+        // Reused whenever the OS default input/output device changes mid-session
+        // (e.g. connecting Bluetooth headphones), since cpal streams stay bound
+        // to whatever device was default at the moment they were opened.
+        let build_engine = {
+            let handle = handle.clone();
+            let hub_for_callback = hub_for_callback.clone();
+            move || {
+                let handle = handle.clone();
+                let hub_for_callback = hub_for_callback.clone();
+                capture::AudioCapture::start(move |speaker, pcm, ended| {
+                    if let Some(hub) = &hub_for_callback {
+                        hub.push(speaker, pcm.clone(), ended);
                     }
-                }
-                drop(engine);
+                    let (rms, peak) = audio_level(&pcm);
+                    let _ = handle.emit("audio-level", serde_json::json!({"speaker": speaker, "rms": rms, "peak": peak, "active": rms >= 0.012}));
+                })
             }
+        };
+        let mut engine = match build_engine() {
+            Ok(engine) => engine,
             Err(error) => {
                 let _ = ready_tx.send(Err(error));
+                return;
+            }
+        };
+        let names = engine.device_names();
+        let _ = ready_tx.send(Ok(names));
+        loop {
+            match stop_rx.recv_timeout(std::time::Duration::from_millis(2000)) {
+                Ok(capture::CaptureCommand::Stop) => break,
+                Ok(capture::CaptureCommand::SetSource {
+                    speaker,
+                    enabled,
+                    reply,
+                }) => {
+                    let _ = reply.send(engine.set_source_enabled(&speaker, enabled));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let current = capture::default_status();
+                    let (mic_name, loopback_name) = engine.device_names();
+                    let mic_changed = current.microphone_name.as_deref() != Some(mic_name.as_str());
+                    let loopback_changed =
+                        current.loopback_name.as_deref() != Some(loopback_name.as_str());
+                    if mic_changed || loopback_changed {
+                        if let Ok(new_engine) = build_engine() {
+                            let (new_mic, new_loopback) = new_engine.device_names();
+                            engine = new_engine;
+                            let _ = handle.emit(
+                                "audio-device-changed",
+                                serde_json::json!({"microphoneName": new_mic, "loopbackName": new_loopback}),
+                            );
+                        }
+                        // If rebuilding failed (e.g. device mid-handshake), keep the
+                        // old engine running and check again on the next tick.
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+        drop(engine);
     });
     match ready_rx
         .recv_timeout(std::time::Duration::from_secs(3))
@@ -525,6 +619,192 @@ fn sessions_file(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     Ok(dir.join("sessions.json"))
 }
 
+fn user_profile_file(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("user_profile.json"))
+}
+
+fn usage_stats_file(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir.join("usage_stats.json"))
+}
+
+// Mirrors the pricing the frontend already shows per-session in the Live
+// header ($ badge), so the persisted lifetime total in Settings stays
+// consistent with what the presenter sees while a session is running.
+const PRIMARY_INPUT_RATE_PER_MILLION: f64 = 0.75;
+const PRIMARY_OUTPUT_RATE_PER_MILLION: f64 = 3.75;
+const FALLBACK_INPUT_RATE_PER_MILLION: f64 = 0.30;
+const FALLBACK_OUTPUT_RATE_PER_MILLION: f64 = 2.50;
+
+fn estimate_cost_usd(model_used: &str, input_tokens: u64, output_tokens: u64, thought_tokens: u64) -> f64 {
+    let (input_rate, output_rate) = if model_used.contains("2.5-flash") {
+        (FALLBACK_INPUT_RATE_PER_MILLION, FALLBACK_OUTPUT_RATE_PER_MILLION)
+    } else {
+        (PRIMARY_INPUT_RATE_PER_MILLION, PRIMARY_OUTPUT_RATE_PER_MILLION)
+    };
+    (input_tokens as f64 * input_rate + (output_tokens + thought_tokens) as f64 * output_rate) / 1_000_000.0
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct UsageStats {
+    total_cost_usd: f64,
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+    total_calls: u64,
+    #[serde(default)]
+    last_updated: Option<String>,
+}
+
+fn read_usage_stats_file(app: &AppHandle) -> Result<UsageStats, String> {
+    let path = usage_stats_file(app)?;
+    if !path.exists() {
+        return Ok(UsageStats::default());
+    }
+    serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())
+}
+
+/// Best-effort accumulation of Gemini spend across sessions, so Settings can
+/// show a lifetime total instead of only the current session's estimate.
+/// Errors are swallowed by callers - a failed write here should never break
+/// the underlying Gemini feature that triggered it.
+fn record_usage(
+    app: &AppHandle,
+    model_used: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    thought_tokens: u64,
+) -> Result<(), String> {
+    if input_tokens == 0 && output_tokens == 0 && thought_tokens == 0 {
+        return Ok(());
+    }
+    let path = usage_stats_file(app)?;
+    let mut stats = read_usage_stats_file(app)?;
+    stats.total_cost_usd += estimate_cost_usd(model_used, input_tokens, output_tokens, thought_tokens);
+    stats.total_input_tokens += input_tokens;
+    stats.total_output_tokens += output_tokens + thought_tokens;
+    stats.total_calls += 1;
+    stats.last_updated = Some(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .to_string(),
+    );
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&stats).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_usage_stats(app: AppHandle) -> Result<UsageStats, String> {
+    read_usage_stats_file(&app)
+}
+
+#[tauri::command]
+fn reset_usage_stats(app: AppHandle) -> Result<(), String> {
+    let path = usage_stats_file(&app)?;
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&UsageStats::default()).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AppInfo {
+    version: String,
+    identifier: String,
+    data_dir: String,
+    primary_model: String,
+    fallback_models: Vec<String>,
+}
+
+#[tauri::command]
+fn get_app_info(app: AppHandle) -> Result<AppInfo, String> {
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    Ok(AppInfo {
+        version: app.package_info().version.to_string(),
+        identifier: app.config().identifier.clone(),
+        data_dir: data_dir.display().to_string(),
+        primary_model: GEMINI_MODEL.to_string(),
+        fallback_models: GEMINI_FALLBACK_MODELS.iter().map(|m| m.to_string()).collect(),
+    })
+}
+
+fn dedup_terms(terms: Vec<String>, cap: usize) -> Vec<String> {
+    let mut result: Vec<String> = Vec::new();
+    for term in terms {
+        let term = term.trim().to_string();
+        if term.is_empty()
+            || result
+                .iter()
+                .any(|existing: &String| existing.eq_ignore_ascii_case(&term))
+        {
+            continue;
+        }
+        result.push(term);
+        if result.len() == cap {
+            break;
+        }
+    }
+    result
+}
+
+fn read_user_profile_file(app: &AppHandle) -> Result<Option<UserProfile>, String> {
+    let path = user_profile_file(app)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let profile = serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    Ok(Some(profile))
+}
+
+/// Best-effort accumulation of technical vocabulary across sessions, so
+/// terms seen in one presentation's document keep helping later ones (e.g.
+/// live-transcription hints) without the user re-entering them. Errors are
+/// swallowed by callers since this is a background enrichment, not something
+/// that should block document extraction or session prep.
+fn merge_profile_vocabulary(app: &AppHandle, new_terms: &[String]) -> Result<(), String> {
+    if new_terms.is_empty() {
+        return Ok(());
+    }
+    let path = user_profile_file(app)?;
+    let mut profile = read_user_profile_file(app)?.unwrap_or_default();
+    let mut combined = profile.vocabulary.clone();
+    combined.extend(new_terms.iter().cloned());
+    profile.vocabulary = dedup_terms(combined, 200);
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&profile).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_user_profile(app: AppHandle) -> Result<Option<UserProfile>, String> {
+    read_user_profile_file(&app)
+}
+
+#[tauri::command]
+fn save_user_profile(app: AppHandle, mut profile: UserProfile) -> Result<(), String> {
+    profile.vocabulary = dedup_terms(profile.vocabulary, 200);
+    let path = user_profile_file(&app)?;
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&profile).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn save_session(app: AppHandle, session: SessionRecord) -> Result<(), String> {
     save_session_record(&app, session)
@@ -545,6 +825,64 @@ fn save_session_record(app: &AppHandle, session: SessionRecord) -> Result<(), St
         serde_json::to_vec_pretty(&sessions).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())
+}
+
+/// Persists the generated slide deck (guion) onto an already-saved session
+/// record, so reopening it from history can offer presentation mode again -
+/// this is written separately from `save_session_record` because the deck is
+/// only known after the base session record already exists.
+#[tauri::command]
+fn save_presentation_deck(
+    app: AppHandle,
+    id: String,
+    pages: Vec<String>,
+    scripts: Vec<SlideScript>,
+    intro: ScriptBlock,
+    outro: ScriptBlock,
+) -> Result<(), String> {
+    let path = sessions_file(&app)?;
+    let mut sessions: Vec<SessionRecord> = if path.exists() {
+        serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if let Some(record) = sessions.iter_mut().find(|item| item.id == id) {
+        record.slide_pages = pages;
+        record.slide_scripts = scripts;
+        record.intro_script = Some(intro);
+        record.outro_script = Some(outro);
+    }
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&sessions).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn presentations_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("presentations");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+/// The PDF itself is kept out of sessions.json (which stays a single JSON
+/// array parsed whole on every load) and written as its own file instead, so
+/// history stays fast to load even with many saved presentations.
+#[tauri::command]
+fn save_presentation_pdf(app: AppHandle, id: String, bytes: Vec<u8>) -> Result<(), String> {
+    let path = presentations_dir(&app)?.join(format!("{id}.pdf"));
+    fs::write(path, bytes).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn load_presentation_pdf(app: AppHandle, id: String) -> Result<Vec<u8>, String> {
+    let path = presentations_dir(&app)?.join(format!("{id}.pdf"));
+    fs::read(&path).map_err(|_| "No se encontró el PDF guardado de esta sesión".to_string())
 }
 
 #[tauri::command]
@@ -595,6 +933,7 @@ fn delete_session(app: AppHandle, id: String) -> Result<(), String> {
         serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
             .unwrap_or_default();
     sessions.retain(|item| item.id != id);
+    let _ = fs::remove_file(presentations_dir(&app)?.join(format!("{id}.pdf")));
     fs::write(
         path,
         serde_json::to_vec_pretty(&sessions).map_err(|e| e.to_string())?,
@@ -778,7 +1117,7 @@ fn structured_interaction_input(
     Ok((response, output))
 }
 
-fn extract_pdf_with_gemini(bytes: &[u8]) -> Result<document::DocumentContext, String> {
+fn extract_pdf_with_gemini(app: &AppHandle, bytes: &[u8]) -> Result<document::DocumentContext, String> {
     let schema = serde_json::json!({
         "type": "object",
         "properties": {
@@ -815,6 +1154,7 @@ fn extract_pdf_with_gemini(bytes: &[u8]) -> Result<document::DocumentContext, St
         &mut output_tokens,
         &mut thought_tokens,
     );
+    let _ = record_usage(app, &model_used, input_tokens, output_tokens, thought_tokens);
     document::context_from_text(
         parsed.text,
         "PDF".into(),
@@ -824,6 +1164,7 @@ fn extract_pdf_with_gemini(bytes: &[u8]) -> Result<document::DocumentContext, St
         Some(model_used),
         input_tokens,
         output_tokens + thought_tokens,
+        None,
     )
 }
 
@@ -849,7 +1190,7 @@ fn apply_usage(
         .unwrap_or(0);
 }
 
-fn generate_practice_questions(context: &str) -> Result<Vec<PracticeQuestion>, String> {
+fn generate_practice_questions(app: &AppHandle, context: &str) -> Result<Vec<PracticeQuestion>, String> {
     let prompt = format!(
         r#"Create 10 realistic questions an audience may ask after this presentation and a short spoken answer for each.
 Answers must be natural CEFR B2 English, 1-3 sentences, under 45 words, grounded only in the supplied context, and safe when information is missing.
@@ -871,14 +1212,24 @@ SESSION CONTEXT:
         },
         "required": ["questions"]
     });
-    let (_, output) = structured_interaction(&prompt, schema, None)?;
+    let (response, output) = structured_interaction(&prompt, schema, None)?;
     let practice: PracticeResponse = serde_json::from_value(output)
         .map_err(|error| format!("Could not read practice material: {error}"))?;
+    let (mut model_used, mut input_tokens, mut output_tokens, mut thought_tokens) =
+        (String::new(), 0, 0, 0);
+    apply_usage(
+        &response,
+        &mut model_used,
+        &mut input_tokens,
+        &mut output_tokens,
+        &mut thought_tokens,
+    );
+    let _ = record_usage(app, &model_used, input_tokens, output_tokens, thought_tokens);
     Ok(practice.questions.into_iter().take(10).collect())
 }
 
 #[tauri::command]
-fn analyze_transcript(request: TranscriptAnalysisRequest) -> Result<TranscriptAnalysis, String> {
+fn analyze_transcript(app: AppHandle, request: TranscriptAnalysisRequest) -> Result<TranscriptAnalysis, String> {
     let prompt = format!(
         r#"Analyze one finalized utterance from a live presentation.
 Translate English to natural Latin American Spanish, and Spanish to natural English. Preserve technical names and numbers.
@@ -917,11 +1268,19 @@ UTTERANCE:
         &mut analysis.output_tokens,
         &mut analysis.thought_tokens,
     );
+    let _ = record_usage(
+        &app,
+        &analysis.model_used,
+        analysis.input_tokens,
+        analysis.output_tokens,
+        analysis.thought_tokens,
+    );
     Ok(analysis)
 }
 
 #[tauri::command]
 fn generate_answer_variant(
+    app: AppHandle,
     request: AnswerVariantRequest,
     state: State<'_, RuntimeState>,
 ) -> Result<AnswerVariant, String> {
@@ -974,11 +1333,19 @@ CURRENT ANSWER:
         &mut variant.output_tokens,
         &mut variant.thought_tokens,
     );
+    let _ = record_usage(
+        &app,
+        &variant.model_used,
+        variant.input_tokens,
+        variant.output_tokens,
+        variant.thought_tokens,
+    );
     Ok(variant)
 }
 
 #[tauri::command]
 fn generate_copilot_answer(
+    app: AppHandle,
     request: CopilotRequest,
     state: State<'_, RuntimeState>,
 ) -> Result<CopilotAnswer, String> {
@@ -1034,6 +1401,13 @@ QUESTION:
         &mut answer.output_tokens,
         &mut answer.thought_tokens,
     );
+    let _ = record_usage(
+        &app,
+        &answer.model_used,
+        answer.input_tokens,
+        answer.output_tokens,
+        answer.thought_tokens,
+    );
     if let Some(id) = response
         .get("id")
         .or_else(|| response.get("interaction_id"))
@@ -1047,6 +1421,271 @@ QUESTION:
     Ok(answer)
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SlideScript {
+    index: u32,
+    script_en: String,
+    pronunciation: String,
+    script_es: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct ScriptBlock {
+    script_en: String,
+    pronunciation: String,
+    script_es: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SlideDeckResponse {
+    intro: ScriptBlock,
+    outro: ScriptBlock,
+    slides: Vec<SlideScript>,
+}
+
+#[tauri::command]
+fn generate_slide_scripts(
+    app: AppHandle,
+    pages: Vec<String>,
+    request: PrepareRequest,
+) -> Result<SlideDeckResponse, String> {
+    if pages.is_empty() {
+        return Err("No hay diapositivas para generar el guion".into());
+    }
+    let session_context = format!(
+        "TITLE: {}\nPRESENTER ROLE: {}\nAUDIENCE: {}\nENGLISH LEVEL: {}\nRESPONSE LENGTH: {}\nIMPORTANT FACTS:\n{}\nFORBIDDEN CLAIMS:\n{}\nPROJECT CONTEXT:\n{}",
+        request.title.trim(),
+        request.role.trim(),
+        request.audience.trim(),
+        request.level.trim(),
+        request.response_length.trim(),
+        request.important_facts.trim(),
+        request.forbidden_claims.trim(),
+        request.context.trim(),
+    );
+    let slides_block = pages
+        .iter()
+        .enumerate()
+        .map(|(index, text)| format!("SLIDE {}:\n{}", index + 1, text))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let prompt = format!(
+        r#"Write the spoken teleprompter material for a live presentation: an opening greeting, one script per slide (same order as given below), and a closing.
+Produce an "intro" block: a short greeting and topic introduction (2-4 sentences, under 70 words) the presenter says before showing slide content - welcome the audience, say what the session is about, using the session context below. It is not tied to any single slide.
+Produce an "outro" block: a short closing (2-4 sentences, under 70 words) the presenter says after the last slide - thank the audience and invite questions. It is not tied to any single slide.
+For "intro", "outro", and each entry in "slides", produce three fields:
+- "scriptEn": natural CEFR B2 English, sound like something a presenter actually says out loud (not slide bullet points read verbatim), grounded only in that block's context below.
+- "pronunciation": a simplified pronunciation guide for that exact "scriptEn" text, written as Spanish-reader-friendly syllable respelling (NOT the International Phonetic Alphabet), with the stressed syllable of each word in CAPS, so a Spanish-speaking presenter who does not know IPA can read it aloud correctly. Example: "Today I am going to explain" -> "tu-DAY ai am GOU-ing tu eks-PLEIN".
+- "scriptEs": a natural Spanish translation of that same "scriptEn" text, for quick silent reference only (not meant to be read aloud during the presentation).
+
+SESSION CONTEXT:
+{session_context}
+
+SLIDES:
+{slides_block}"#
+    );
+    let script_block_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "scriptEn": {"type": "string"},
+            "pronunciation": {"type": "string"},
+            "scriptEs": {"type": "string"}
+        },
+        "required": ["scriptEn", "pronunciation", "scriptEs"]
+    });
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "intro": script_block_schema.clone(),
+            "outro": script_block_schema,
+            "slides": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "index": {"type": "integer"},
+                        "scriptEn": {"type": "string"},
+                        "pronunciation": {"type": "string"},
+                        "scriptEs": {"type": "string"}
+                    },
+                    "required": ["index", "scriptEn", "pronunciation", "scriptEs"]
+                }
+            }
+        },
+        "required": ["intro", "outro", "slides"]
+    });
+    let (response, output) = structured_interaction_input(
+        serde_json::Value::String(prompt),
+        schema,
+        None,
+        Duration::from_secs(60),
+    )?;
+    let parsed: SlideDeckResponse = serde_json::from_value(output)
+        .map_err(|error| format!("Could not read slide scripts: {error}"))?;
+    let (mut model_used, mut input_tokens, mut output_tokens, mut thought_tokens) =
+        (String::new(), 0, 0, 0);
+    apply_usage(
+        &response,
+        &mut model_used,
+        &mut input_tokens,
+        &mut output_tokens,
+        &mut thought_tokens,
+    );
+    let _ = record_usage(&app, &model_used, input_tokens, output_tokens, thought_tokens);
+    Ok(parsed)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MonitorInfo {
+    index: usize,
+    name: String,
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+}
+
+#[tauri::command]
+fn list_monitors(app: AppHandle) -> Result<Vec<MonitorInfo>, String> {
+    let monitors = app
+        .available_monitors()
+        .map_err(|error| format!("No se pudieron listar los monitores: {error}"))?;
+    Ok(monitors
+        .into_iter()
+        .enumerate()
+        .map(|(index, monitor)| MonitorInfo {
+            index,
+            name: monitor
+                .name()
+                .cloned()
+                .unwrap_or_else(|| format!("Monitor {}", index + 1)),
+            width: monitor.size().width,
+            height: monitor.size().height,
+            x: monitor.position().x,
+            y: monitor.position().y,
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn open_presenter_window(app: AppHandle, monitor_index: usize) -> Result<(), String> {
+    if app.get_webview_window("presenter").is_some() {
+        return Ok(());
+    }
+    let monitors = app
+        .available_monitors()
+        .map_err(|error| format!("No se pudieron listar los monitores: {error}"))?;
+    let monitor = monitors
+        .get(monitor_index)
+        .or_else(|| monitors.first())
+        .ok_or_else(|| "No se detectó ningún monitor".to_string())?;
+    let scale = monitor.scale_factor();
+    let position = monitor.position();
+    let logical_x = position.x as f64 / scale;
+    let logical_y = position.y as f64 / scale;
+    // No .skip_taskbar(true) here: on Windows that maps to the WS_EX_TOOLWINDOW
+    // style, which hides a window from Alt+Tab *and* from the "share a window"
+    // picker in Zoom/Teams - exactly the window this one exists to be shared.
+    let window = WebviewWindowBuilder::new(&app, "presenter", WebviewUrl::App("index.html".into()))
+        .title("Voxa — Presentación")
+        .position(logical_x, logical_y)
+        .fullscreen(true)
+        .decorations(false)
+        .always_on_top(true)
+        .visible(true)
+        .build()
+        .map_err(|error| format!("No se pudo abrir la ventana de presentación: {error}"))?;
+    // Esc (handled in the presenter's own JS) closes the window directly, and
+    // the control window loses track of it otherwise (stale next/prev, a
+    // confusing "Finalizar" no-op) - so tell "main" whenever it goes away,
+    // regardless of how (Esc, Alt+F4, or close_presenter_window below).
+    let app_for_event = app.clone();
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::Destroyed = event {
+            let _ = app_for_event.emit_to("main", "presenter-closed", ());
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+async fn identify_monitors(app: AppHandle) -> Result<(), String> {
+    let monitors = app
+        .available_monitors()
+        .map_err(|error| format!("No se pudieron listar los monitores: {error}"))?;
+    let (width, height) = (260.0, 180.0);
+    for (index, monitor) in monitors.iter().enumerate() {
+        let label = format!("identify-{index}");
+        if app.get_webview_window(&label).is_some() {
+            continue;
+        }
+        let scale = monitor.scale_factor();
+        let position = monitor.position();
+        let size = monitor.size();
+        let logical_x = position.x as f64 / scale + (size.width as f64 / scale - width) / 2.0;
+        let logical_y = position.y as f64 / scale + (size.height as f64 / scale - height) / 2.0;
+        WebviewWindowBuilder::new(&app, label.as_str(), WebviewUrl::App("index.html".into()))
+            .title(format!("Voxa — Monitor {}", index + 1))
+            .position(logical_x, logical_y)
+            .inner_size(width, height)
+            .decorations(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .resizable(false)
+            .focused(false)
+            .build()
+            .map_err(|error| format!("No se pudo mostrar el identificador de monitor: {error}"))?;
+        let app_for_close = app.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(3000));
+            if let Some(window) = app_for_close.get_webview_window(&label) {
+                let _ = window.close();
+            }
+        });
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn close_presenter_window(app: AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("presenter") {
+        window
+            .close()
+            .map_err(|error| format!("No se pudo cerrar la ventana de presentación: {error}"))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_presentation_pdf(bytes: Vec<u8>, state: State<'_, RuntimeState>) -> Result<(), String> {
+    *state
+        .presentation_pdf
+        .lock()
+        .map_err(|_| "Presentation state is unavailable".to_string())? = Some(bytes);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_presentation_pdf(state: State<'_, RuntimeState>) -> Result<Vec<u8>, String> {
+    state
+        .presentation_pdf
+        .lock()
+        .map_err(|_| "Presentation state is unavailable".to_string())?
+        .clone()
+        .ok_or_else(|| "No hay ninguna presentación cargada".to_string())
+}
+
+#[tauri::command]
+fn set_slide_index(app: AppHandle, index: u32) -> Result<(), String> {
+    app.emit_to("presenter", "slide-changed", index)
+        .map_err(|error| format!("No se pudo avanzar la diapositiva: {error}"))?;
+    Ok(())
+}
+
 pub fn run() {
     let runtime = RuntimeState {
         capture_stop: std::sync::Mutex::new(None),
@@ -1055,9 +1694,29 @@ pub fn run() {
         knowledge_context: std::sync::Mutex::new(None),
         session_context: std::sync::Mutex::new(None),
         vocabulary_context: std::sync::Mutex::new(Vec::new()),
+        presentation_pdf: std::sync::Mutex::new(None),
     };
     tauri::Builder::default()
         .manage(runtime)
+        .setup(|app| {
+            // The presenter (and any transient identify-N) windows are only
+            // meaningful while the control window is open - without this,
+            // closing "main" leaves the fullscreen presenter window orphaned
+            // with no way to control or close it.
+            if let Some(main_window) = app.get_webview_window("main") {
+                let handle = app.handle().clone();
+                main_window.on_window_event(move |event| {
+                    if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                        for (label, window) in handle.webview_windows() {
+                            if label != "main" {
+                                let _ = window.close();
+                            }
+                        }
+                    }
+                });
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             check_system,
             prepare_session,
@@ -1077,7 +1736,23 @@ pub fn run() {
             gemini_health,
             analyze_transcript,
             generate_answer_variant,
-            generate_copilot_answer
+            generate_copilot_answer,
+            generate_slide_scripts,
+            list_monitors,
+            open_presenter_window,
+            close_presenter_window,
+            set_presentation_pdf,
+            get_presentation_pdf,
+            set_slide_index,
+            identify_monitors,
+            get_user_profile,
+            save_user_profile,
+            get_usage_stats,
+            reset_usage_stats,
+            get_app_info,
+            save_presentation_deck,
+            save_presentation_pdf,
+            load_presentation_pdf
         ])
         .run(tauri::generate_context!())
         .expect("error while running Voxa");

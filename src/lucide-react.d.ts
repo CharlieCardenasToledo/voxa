@@ -7,11 +7,14 @@ declare module 'lucide-react' {
   export const BookOpen: ComponentType<IconProps>;
   export const Check: ComponentType<IconProps>;
   export const ChevronDown: ComponentType<IconProps>;
+  export const ChevronLeft: ComponentType<IconProps>;
+  export const ChevronRight: ComponentType<IconProps>;
   export const FileText: ComponentType<IconProps>;
   export const Headphones: ComponentType<IconProps>;
   export const Keyboard: ComponentType<IconProps>;
   export const Layers3: ComponentType<IconProps>;
   export const Mic: ComponentType<IconProps>;
+  export const Monitor: ComponentType<IconProps>;
   export const MoreHorizontal: ComponentType<IconProps>;
   export const Pause: ComponentType<IconProps>;
   export const Play: ComponentType<IconProps>;

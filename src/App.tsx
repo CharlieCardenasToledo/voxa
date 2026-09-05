@@ -1,7 +1,14 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import { AlertTriangle, ArrowRight, ChevronDown, FileText, Mic, Pause, Play, Radio, Settings2, Upload, Volume2 } from 'lucide-react';
-import { useStore, type Screen, type Turn } from './store';
-import { analyzeTranscript, checkGeminiHealth, checkSystem, deleteSession, extractDocument, generateAnswerVariant, generateCopilotAnswer, isNativeRuntime, loadSessions, onAudioLevel, onNativeTranscript, onTranscriptionStatus, onUsageUpdate, prepareNativeSession, restoreSession, setAudioSourceEnabled, setGeminiApiKey, startAudioCapture, startNativeSession, stopAudioCapture, stopNativeSession, validateGeminiApiKey, type CaptureStatus, type GeminiHealthReport, type NativeCopilotAnswer, type SavedSession, type SystemCheck } from './services/native';
+import { AlertTriangle, ArrowRight, ChevronDown, ChevronLeft, ChevronRight, FileText, Mic, Monitor as MonitorIcon, Pause, Play, Radio, RotateCcw, Settings2, Upload, Volume2 } from 'lucide-react';
+import { useStore, type PresentationPhase, type Screen, type SessionMode, type SlideScriptEntry, type Turn } from './store';
+import { analyzeTranscript, checkGeminiHealth, checkSystem, closePresenterWindow, deleteSession, extractDocument, generateAnswerVariant, generateCopilotAnswer, generateSlideScripts, getAppInfo, getUsageStats, getUserProfile, identifyMonitors, isNativeRuntime, listMonitors, loadPresentationPdf, loadSessions, onAudioDeviceChanged, onAudioLevel, onNativeTranscript, onPresenterClosed, onTranscriptionStatus, onUsageUpdate, openPresenterWindow, prepareNativeSession, resetUsageStats, restoreSession, savePresentationDeck, savePresentationPdf, saveUserProfile, setAudioSourceEnabled, setGeminiApiKey, setPresentationPdf, setSlideIndex, startAudioCapture, startNativeSession, stopAudioCapture, stopNativeSession, validateGeminiApiKey, type AppInfo, type CaptureStatus, type GeminiHealthReport, type MonitorInfo, type NativeCopilotAnswer, type PrepareSessionRequest, type SavedSession, type SystemCheck, type UsageStats, type UserProfile } from './services/native';
+
+// Holds the raw PDF bytes and the chosen monitor between Prepare/Practice
+// (where they're picked) and Live (where a closed presenter window can be
+// reopened without asking again). Module-scoped like `answerGeneration`
+// below, since neither needs to survive a full app reload.
+let presentationFileBytes: Uint8Array | null = null;
+let presentationMonitorIndex = 0;
 
 const screens: { id: Screen; label: string }[] = [
   { id: 'prepare', label: 'Preparar' },
@@ -18,38 +25,19 @@ const audienceLabel = (audience: string) => ({
 function App() {
   const store = useStore();
   const [system, setSystem] = useState<SystemCheck | null>(null);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [apiKey, setApiKey] = useState('');
-  const [savingKey, setSavingKey] = useState(false);
-  const [keyMessage, setKeyMessage] = useState('');
-  const [health, setHealth] = useState<GeminiHealthReport | null>(null);
-  const [healthLoading, setHealthLoading] = useState(false);
-
-  const runHealthCheck = async () => {
-    setHealthLoading(true);
-    try {
-      setHealth(await checkGeminiHealth());
-    } catch (cause) {
-      setHealth({ overallOk: false, checks: [{ id: 'error', label: 'Diagnóstico', ok: false, message: cause instanceof Error ? cause.message : 'No se pudo ejecutar el diagnóstico.', latencyMs: 0 }] });
-    } finally {
-      setHealthLoading(false);
-    }
-  };
+  const [profile, setProfile] = useState<UserProfile | null | undefined>(undefined);
 
   useEffect(() => {
     checkSystem().then(setSystem).catch(() => setSystem({ microphone: false, loopback: false, internet: false, apiConfigured: false }));
   }, []);
   useEffect(() => {
-    const open = () => { setKeyMessage(''); setSettingsOpen(true); };
+    getUserProfile().then(setProfile).catch(() => setProfile({ name: '', professionalContext: '', vocabulary: [] }));
+  }, []);
+  useEffect(() => {
+    const open = () => store.setScreen('settings');
     window.addEventListener('voxa-open-settings', open);
     return () => window.removeEventListener('voxa-open-settings', open);
   }, []);
-  useEffect(() => {
-    if (!settingsOpen) return;
-    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape') setSettingsOpen(false); };
-    window.addEventListener('keydown', closeOnEscape);
-    return () => window.removeEventListener('keydown', closeOnEscape);
-  }, [settingsOpen]);
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (!(event.ctrlKey && event.shiftKey)) return;
@@ -62,48 +50,104 @@ function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
-  const openSettings = () => { setKeyMessage(''); setSettingsOpen(true); };
   const systemReady = Boolean(system?.apiConfigured && system.microphone && system.loopback);
   return <div className="app">
     <header className="app-header">
       <button className="wordmark" onClick={() => store.setScreen('prepare')} aria-label="Ir a Preparar">Voxa</button>
       <nav className="main-nav" aria-label="Navegación principal">
-        {screens.map(({ id, label }) => { const unavailable = id !== 'prepare' && !store.prepared; return <button key={id} className={store.screen === id ? 'active' : ''} disabled={unavailable} title={unavailable ? 'Primero prepara una sesión' : undefined} onClick={() => store.setScreen(id)}>{label}</button>; })}
+        {screens.map(({ id, label }) => { const skippedForReunion = id === 'practice' && store.sessionMode === 'reunion'; const unavailable = id !== 'prepare' && (!store.prepared || skippedForReunion); return <button key={id} className={store.screen === id ? 'active' : ''} disabled={unavailable} title={unavailable ? (skippedForReunion ? 'No aplica en modo Reunión' : 'Primero prepara una sesión') : undefined} onClick={() => store.setScreen(id)}>{label}</button>; })}
       </nav>
       <div className="header-actions">
-        <button className={`system-status ${systemReady ? 'ready' : 'attention'}`} onClick={!systemReady && isNativeRuntime() ? openSettings : undefined}>
+        <button className={`system-status ${systemReady ? 'ready' : 'attention'}`} onClick={!systemReady && isNativeRuntime() ? () => store.setScreen('settings') : undefined}>
           <i />{systemReady ? 'Listo' : isNativeRuntime() ? system?.apiConfigured ? 'Revisar audio' : 'Conectar Gemini' : 'Vista del navegador'}
         </button>
-        <button className="icon-button" onClick={openSettings} aria-label="Configuración"><Settings2 size={18} /></button>
+        <button className={`icon-button ${store.screen === 'settings' ? 'active' : ''}`} onClick={() => store.setScreen('settings')} aria-label="Configuración"><Settings2 size={18} /></button>
       </div>
     </header>
     <main className={`screen screen-${store.screen}`}>
       {store.screen === 'prepare' && <Prepare />}
       {store.screen === 'practice' && <Practice />}
       {store.screen === 'live' && <><LiveAudioBridge /><Live /></>}
+      {store.screen === 'settings' && <Settings system={system} setSystem={setSystem} profile={profile} setProfile={setProfile} />}
     </main>
-    {settingsOpen && <div className="modal-backdrop" onClick={() => setSettingsOpen(false)}>
-      <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" onClick={event => event.stopPropagation()}>
-        <div className="modal-head"><div><p className="overline">Configuración</p><h2 id="settings-title">Conectar Gemini</h2></div><button className="icon-button" aria-label="Cerrar configuración" onClick={() => setSettingsOpen(false)}>×</button></div>
+    {profile === null && <Onboarding onComplete={setProfile} />}
+  </div>;
+}
+
+type SettingsTab = 'account' | 'profile' | 'usage' | 'diagnostics';
+
+function Settings({ system, setSystem, profile, setProfile }: { system: SystemCheck | null; setSystem: (system: SystemCheck) => void; profile: UserProfile | null | undefined; setProfile: (profile: UserProfile) => void }) {
+  const [tab, setTab] = useState<SettingsTab>('account');
+  const [apiKey, setApiKey] = useState('');
+  const [savingKey, setSavingKey] = useState(false);
+  const [keyMessage, setKeyMessage] = useState('');
+  const [health, setHealth] = useState<GeminiHealthReport | null>(null);
+  const [healthLoading, setHealthLoading] = useState(false);
+  const [profileName, setProfileName] = useState('');
+  const [profileContext, setProfileContext] = useState('');
+  const [profileVocabulary, setProfileVocabulary] = useState('');
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [profileMessage, setProfileMessage] = useState('');
+  const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
+  const [usageStats, setUsageStats] = useState<UsageStats | null>(null);
+  const [usageResetting, setUsageResetting] = useState(false);
+  const [confirmingReset, setConfirmingReset] = useState(false);
+
+  const runHealthCheck = async () => {
+    setHealthLoading(true);
+    try {
+      setHealth(await checkGeminiHealth());
+    } catch (cause) {
+      setHealth({ overallOk: false, checks: [{ id: 'error', label: 'Diagnóstico', ok: false, message: cause instanceof Error ? cause.message : 'No se pudo ejecutar el diagnóstico.', latencyMs: 0 }] });
+    } finally {
+      setHealthLoading(false);
+    }
+  };
+
+  const confirmResetUsage = async () => {
+    setUsageResetting(true);
+    try {
+      await resetUsageStats();
+      setUsageStats(await getUsageStats());
+      setConfirmingReset(false);
+    } finally {
+      setUsageResetting(false);
+    }
+  };
+
+  useEffect(() => {
+    setProfileName(profile?.name || '');
+    setProfileContext(profile?.professionalContext || '');
+    setProfileVocabulary((profile?.vocabulary || []).join(', '));
+  }, [profile]);
+  useEffect(() => {
+    getAppInfo().then(setAppInfo).catch(() => setAppInfo(null));
+    getUsageStats().then(setUsageStats).catch(() => setUsageStats(null));
+  }, []);
+
+  const tabs: { id: SettingsTab; label: string }[] = [
+    { id: 'account', label: 'Cuenta' },
+    { id: 'profile', label: 'Perfil' },
+    { id: 'usage', label: 'Uso' },
+    { id: 'diagnostics', label: 'Diagnóstico' },
+  ];
+
+  return <div className="page narrow-page">
+    <div className="page-heading compact-heading">
+      <button className="secondary-button back-button" onClick={() => useStore.getState().setScreen('prepare')}><ChevronLeft size={15} /> Volver</button>
+      <p className="overline">Configuración</p>
+      <h1>Voxa</h1>
+    </div>
+    <nav className="settings-tabs" aria-label="Secciones de configuración">
+      {tabs.map(({ id, label }) => <button key={id} type="button" className={tab === id ? 'active' : ''} onClick={() => setTab(id)}>{label}</button>)}
+    </nav>
+    <section className="card prepare-card">
+      {tab === 'account' && <>
         <p className="supporting">Tu clave se guarda de forma segura en el Administrador de credenciales de Windows.</p>
         <ol className="settings-guide"><li><strong>1</strong><span>Pega tu clave API.</span></li><li><strong>2</strong><span>Guárdala y ejecuta el diagnóstico.</span></li><li><strong>3</strong><span>Cuando todo esté correcto, prepara una sesión y abre <b>En vivo</b>.</span></li></ol>
-        <label>Clave API de Gemini<input aria-label="Clave API de Gemini" type="password" value={apiKey} onChange={event => setApiKey(event.target.value)} placeholder="Pega aquí tu clave" autoFocus /></label>
+        <label>Clave API de Gemini<input aria-label="Clave API de Gemini" type="password" value={apiKey} onChange={event => setApiKey(event.target.value)} placeholder="Pega aquí tu clave" /></label>
         {keyMessage && <p className="form-message" role="status">{keyMessage}</p>}
-        <div className="health-panel">
-          <div className="health-head">
-            <p className="overline">Estado de Gemini</p>
-            <button className="secondary-button" onClick={runHealthCheck} disabled={healthLoading}>{healthLoading ? 'Comprobando…' : 'Ejecutar diagnóstico'}</button>
-          </div>
-          {health && <ul className="health-list">
-            {health.checks.map(check => <li key={check.id} className={check.ok ? 'ok' : 'fail'}>
-              <i />
-              <div><strong>{check.label}</strong><span>{check.message}</span></div>
-              {check.latencyMs > 0 && <small>{check.latencyMs} ms</small>}
-            </li>)}
-          </ul>}
-        </div>
         <div className="modal-actions">
-          <button className="secondary-button" onClick={() => setSettingsOpen(false)}>Cancelar</button>
           <button className="primary-button" disabled={!apiKey.trim() || savingKey} onClick={async () => {
             setSavingKey(true);
             try {
@@ -116,13 +160,127 @@ function App() {
             finally { setSavingKey(false); }
           }}>{savingKey ? 'Guardando…' : 'Guardar'}</button>
         </div>
-      </section>
-    </div>}
+        <div className="config-summary">
+          <p className="overline">Configuración de la app</p>
+          <dl>
+            <div><dt>Versión</dt><dd>{appInfo?.version || '—'}</dd></div>
+            <div><dt>Modelo principal</dt><dd>{appInfo?.primaryModel || '—'}</dd></div>
+            <div><dt>Modelo de respaldo</dt><dd>{appInfo?.fallbackModels?.join(', ') || '—'}</dd></div>
+            <div><dt>Micrófono</dt><dd>{system?.microphone ? 'Detectado' : 'No detectado'}</dd></div>
+            <div><dt>Audio del sistema</dt><dd>{system?.loopback ? 'Detectado' : 'No detectado'}</dd></div>
+            <div><dt>Clave de Gemini</dt><dd>{system?.apiConfigured ? 'Configurada' : 'Falta configurar'}</dd></div>
+            <div><dt>Datos guardados en</dt><dd className="config-path">{appInfo?.dataDir || '—'}</dd></div>
+          </dl>
+        </div>
+      </>}
+      {tab === 'profile' && <div className="profile-section no-border">
+        <p className="overline">Tu perfil</p>
+        <label>Tu nombre<input aria-label="Tu nombre" value={profileName} onChange={event => setProfileName(event.target.value)} /></label>
+        <label>Contexto profesional<textarea aria-label="Tu contexto profesional" value={profileContext} onChange={event => setProfileContext(event.target.value)} placeholder="Empresa, equipo, rol habitual" /></label>
+        <label>Vocabulario técnico habitual<textarea aria-label="Vocabulario técnico habitual" value={profileVocabulary} onChange={event => setProfileVocabulary(event.target.value)} placeholder="Términos que Voxa debería recordar entre sesiones" /></label>
+        {profileMessage && <p className="form-message" role="status">{profileMessage}</p>}
+        <button className="secondary-button" disabled={profileSaving} onClick={async () => {
+          setProfileSaving(true);
+          try {
+            const saved: UserProfile = { name: profileName.trim(), professionalContext: profileContext.trim(), vocabulary: profileVocabulary.split(/[,;\n]/).map(term => term.trim()).filter(Boolean) };
+            await saveUserProfile(saved);
+            setProfile(saved);
+            setProfileMessage('Perfil guardado.');
+          } catch (cause) {
+            setProfileMessage(cause instanceof Error ? cause.message : 'No se pudo guardar el perfil.');
+          } finally {
+            setProfileSaving(false);
+          }
+        }}>{profileSaving ? 'Guardando…' : 'Guardar perfil'}</button>
+      </div>}
+      {tab === 'usage' && <div className="usage-summary no-border">
+        <div className="usage-head">
+          <p className="overline">Uso y gasto acumulado</p>
+          <button className="secondary-button" onClick={() => setConfirmingReset(true)}>Reiniciar contador</button>
+        </div>
+        <dl>
+          <div><dt>Gasto estimado (histórico)</dt><dd>$ {(usageStats?.totalCostUsd || 0).toFixed(4)}</dd></div>
+          <div><dt>Llamadas a Gemini</dt><dd>{usageStats?.totalCalls || 0}</dd></div>
+          <div><dt>Tokens (entrada / salida)</dt><dd>{(usageStats?.totalInputTokens || 0).toLocaleString()} / {(usageStats?.totalOutputTokens || 0).toLocaleString()}</dd></div>
+        </dl>
+        <small className="document-privacy">Este total acumula todas las sesiones desde que se instaló (o desde el último reinicio del contador); es independiente del costo estimado que ves durante una sesión En vivo.</small>
+      </div>}
+      {tab === 'diagnostics' && <div className="health-panel no-border">
+        <div className="health-head">
+          <p className="overline">Estado de Gemini</p>
+          <button className="secondary-button" onClick={runHealthCheck} disabled={healthLoading}>{healthLoading ? 'Comprobando…' : 'Ejecutar diagnóstico'}</button>
+        </div>
+        {health && <ul className="health-list">
+          {health.checks.map(check => <li key={check.id} className={check.ok ? 'ok' : 'fail'}>
+            <i />
+            <div><strong>{check.label}</strong><span>{check.message}</span></div>
+            {check.latencyMs > 0 && <small>{check.latencyMs} ms</small>}
+          </li>)}
+        </ul>}
+      </div>}
+    </section>
+    {confirmingReset && <ConfirmDialog title="Reiniciar contador de gasto" message="Esto borra el historial acumulado de gasto en Gemini (costo, llamadas y tokens desde siempre). No se puede deshacer." confirmLabel="Reiniciar" danger busy={usageResetting} onConfirm={() => void confirmResetUsage()} onCancel={() => setConfirmingReset(false)} />}
+  </div>;
+}
+
+function ConfirmDialog({ title, message, confirmLabel, danger, busy, onConfirm, onCancel }: { title: string; message: string; confirmLabel: string; danger?: boolean; busy?: boolean; onConfirm: () => void; onCancel: () => void }) {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') onCancel(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onCancel]);
+  return <div className="modal-backdrop" onClick={onCancel}>
+    <section className="settings-modal" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" onClick={event => event.stopPropagation()}>
+      <div className="modal-head"><div><h2 id="confirm-title">{title}</h2></div></div>
+      <p className="supporting">{message}</p>
+      <div className="modal-actions">
+        <button className="secondary-button" onClick={onCancel} disabled={busy}>Cancelar</button>
+        <button className={danger ? 'end-button' : 'primary-button'} onClick={onConfirm} disabled={busy}>{busy ? 'Un momento…' : confirmLabel}</button>
+      </div>
+    </section>
+  </div>;
+}
+
+function Onboarding({ onComplete }: { onComplete: (profile: UserProfile) => void }) {
+  const [name, setName] = useState('');
+  const [professionalContext, setProfessionalContext] = useState('');
+  const [vocabulary, setVocabulary] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  const finish = async (skip: boolean) => {
+    setSaving(true); setError('');
+    const saved: UserProfile = skip
+      ? { name: '', professionalContext: '', vocabulary: [] }
+      : { name: name.trim(), professionalContext: professionalContext.trim(), vocabulary: vocabulary.split(/[,;\n]/).map(term => term.trim()).filter(Boolean) };
+    try {
+      await saveUserProfile(saved);
+      onComplete(saved);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'No se pudo guardar tu perfil.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return <div className="modal-backdrop">
+    <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="onboarding-title">
+      <div className="modal-head"><div><p className="overline">Bienvenido a Voxa</p><h2 id="onboarding-title">Cuéntale a Voxa sobre ti</h2></div></div>
+      <p className="supporting">Esto ayuda al copiloto a personalizar sus respuestas y a recordar tu vocabulario técnico entre sesiones. Puedes editarlo luego desde Configuración.</p>
+      <label>Tu nombre<input aria-label="Tu nombre" value={name} onChange={event => setName(event.target.value)} placeholder="Ej.: Charlie Cárdenas" autoFocus /></label>
+      <label>Tu contexto profesional<textarea aria-label="Tu contexto profesional" value={professionalContext} onChange={event => setProfessionalContext(event.target.value)} placeholder="Empresa, equipo o rol habitual" /></label>
+      <label>Vocabulario técnico que usas seguido<textarea aria-label="Vocabulario técnico habitual" value={vocabulary} onChange={event => setVocabulary(event.target.value)} placeholder="Nombres de producto, siglas, tecnologías (opcional)" /></label>
+      {error && <p className="form-error"><AlertTriangle size={16} />{error}</p>}
+      <div className="modal-actions">
+        <button className="secondary-button" disabled={saving} onClick={() => void finish(true)}>Omitir por ahora</button>
+        <button className="primary-button" disabled={saving || !name.trim()} onClick={() => void finish(false)}>{saving ? 'Guardando…' : 'Empezar a usar Voxa'}</button>
+      </div>
+    </section>
   </div>;
 }
 
 function Prepare() {
-  const { prepare, setSessionTitle, setSessionId, setPracticeQuestions } = useStore();
+  const { prepare, setSessionTitle, setSessionId, setPracticeQuestions, sessionMode, setSessionMode, setSlideDeck } = useStore();
   const title = useStore(state => state.sessionTitle);
   const [file, setFile] = useState<File | null>(null);
   const [vocabulary, setVocabulary] = useState('');
@@ -137,26 +295,77 @@ function Prepare() {
   const [restoring, setRestoring] = useState(false);
   useEffect(() => { loadSessions().then(setSavedSessions).catch(() => setSavedSessions([])); }, []);
   const [preparing, setPreparing] = useState(false);
+  const [prepareStep, setPrepareStep] = useState('');
   const [error, setError] = useState('');
+  const [pendingDelete, setPendingDelete] = useState<SavedSession | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const prepareGenerationRef = useRef(0);
+
+  const cancelPreparing = () => {
+    prepareGenerationRef.current += 1;
+    setPreparing(false);
+    setPrepareStep('');
+    setError('Preparación cancelada.');
+  };
 
   const prepareClick = async () => {
-    setPreparing(true); setError('');
+    const generation = ++prepareGenerationRef.current;
+    setPreparing(true); setError(''); setPrepareStep('');
     try {
+      if (sessionMode === 'presentation' && (!file || !file.name.toLowerCase().endsWith('.pdf'))) {
+        setError('El modo presentación necesita un archivo PDF.');
+        return;
+      }
       let preparedVocabulary = vocabulary;
+      let presentationPages: string[] | null = null;
       if (file) {
-        const extracted = await extractDocument(file.name, new Uint8Array(await file.arrayBuffer()));
+        setPrepareStep('Extrayendo texto del documento…');
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const extracted = await extractDocument(file.name, bytes);
+        if (generation !== prepareGenerationRef.current) return;
         if (extracted.vocabulary.length && !vocabulary.trim()) {
           preparedVocabulary = extracted.vocabulary.join(', ');
           setVocabulary(preparedVocabulary);
         }
+        if (sessionMode === 'presentation') {
+          if (!extracted.pages || !extracted.pages.length) {
+            setError('Este PDF parece escaneado; el modo presentación necesita un PDF con texto seleccionable.');
+            return;
+          }
+          presentationPages = extracted.pages;
+          presentationFileBytes = bytes;
+        }
       }
-      const session = await prepareNativeSession({ title, role, audience, level, responseLength, importantFacts, forbiddenClaims, context, vocabulary: preparedVocabulary });
+      const requestPayload: PrepareSessionRequest = { title, role, audience, level, responseLength, importantFacts, forbiddenClaims, context, vocabulary: preparedVocabulary, sessionMode };
+      setPrepareStep(sessionMode === 'reunion' ? 'Preparando la sesión…' : 'Generando preguntas de práctica…');
+      const session = await prepareNativeSession(requestPayload);
+      if (generation !== prepareGenerationRef.current) return;
       setSessionId(session.id);
       setPracticeQuestions(session.questions);
+      if (presentationPages) {
+        setPrepareStep('Escribiendo el guion de la presentación…');
+        const deck = await generateSlideScripts(presentationPages, requestPayload);
+        if (generation !== prepareGenerationRef.current) return;
+        const orderedScripts = deck.slides.slice().sort((a, b) => a.index - b.index);
+        setSlideDeck(presentationPages, orderedScripts.map(entry => ({ scriptEn: entry.scriptEn, pronunciation: entry.pronunciation, scriptEs: entry.scriptEs })), deck.intro, deck.outro);
+        // Best-effort: lets this exact presentation (mode + guion + PDF) be
+        // reopened later from "Sesiones recientes" without redoing any of it.
+        void savePresentationDeck(session.id, presentationPages, orderedScripts, deck.intro, deck.outro).catch(() => {});
+        if (presentationFileBytes) void savePresentationPdf(session.id, presentationFileBytes).catch(() => {});
+      }
       prepare(title);
+      if (sessionMode === 'reunion') {
+        // Nothing to rehearse when you're not presenting - skip Practicar
+        // and go straight to the live transcription/translation view.
+        useStore.getState().startLive(false);
+        useStore.getState().setScreen('live');
+      }
     } catch (cause) {
+      if (generation !== prepareGenerationRef.current) return;
       setError(cause instanceof Error ? cause.message : 'No se pudo preparar la sesión.');
-    } finally { setPreparing(false); }
+    } finally {
+      if (generation === prepareGenerationRef.current) { setPreparing(false); setPrepareStep(''); }
+    }
   };
   const restoreSavedSession = async (session: SavedSession) => {
     setRestoring(true); setError('');
@@ -168,25 +377,58 @@ function Prepare() {
       if (storedTranscript) {
         try { useStore.getState().setTurns(JSON.parse(storedTranscript)); } catch { localStorage.removeItem(`voxa:transcript:${restored.id}`); }
       }
+      const mode = (session.session_mode as SessionMode) || 'class';
+      setSessionMode(mode);
+      if (mode === 'presentation' && session.slide_pages?.length && session.slide_scripts?.length) {
+        setSlideDeck(
+          session.slide_pages,
+          session.slide_scripts.map(entry => ({ scriptEn: entry.scriptEn, pronunciation: entry.pronunciation, scriptEs: entry.scriptEs })),
+          session.intro_script ?? null,
+          session.outro_script ?? null,
+        );
+        try {
+          const bytes = await loadPresentationPdf(session.id);
+          if (bytes.length) presentationFileBytes = bytes;
+        } catch {
+          setError('Esta presentación se restauró, pero no se encontró su PDF guardado — vuelve a subirlo en modo Presentación si hace falta.');
+        }
+      } else {
+        setSlideDeck([], [], null, null);
+      }
       prepare(session.title);
     } catch (cause) { setError(cause instanceof Error ? cause.message : 'No se pudo restaurar la sesión guardada.'); }
     finally { setRestoring(false); }
   };
-  const removeSavedSession = async (id: string) => {
-    if (!window.confirm('¿Eliminar esta sesión guardada?')) return;
-    try { await deleteSession(id); localStorage.removeItem(`voxa:transcript:${id}`); setSavedSessions(current => current.filter(session => session.id !== id)); }
-    catch (cause) { setError(cause instanceof Error ? cause.message : 'No se pudo eliminar la sesión guardada.'); }
+  const confirmRemoveSession = async () => {
+    if (!pendingDelete) return;
+    const id = pendingDelete.id;
+    setDeleting(true);
+    try {
+      await deleteSession(id);
+      localStorage.removeItem(`voxa:transcript:${id}`);
+      setSavedSessions(current => current.filter(session => session.id !== id));
+      setPendingDelete(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'No se pudo eliminar la sesión guardada.');
+    } finally {
+      setDeleting(false);
+    }
   };
 
   return <div className="page narrow-page">
     <div className="page-heading"><p className="overline">Antes de la presentación</p><h1>¿Qué vas a presentar?</h1><p>Dale a Voxa suficiente contexto para responder con precisión. Puedes añadir más detalles después.</p><p className="workflow-hint"><strong>1.</strong> Añade tu presentación <span>→</span> <strong>2.</strong> Practica las respuestas <span>→</span> <strong>3.</strong> Abre En vivo</p></div>
     <section className="card prepare-card">
       <label>Nombre de la sesión<input aria-label="Nombre de la sesión" value={title} onChange={event => setSessionTitle(event.target.value)} placeholder="Ej.: Revisión de arquitectura" /></label>
-      <label className="file-field">Archivo de la presentación <span className="file-picker">
-        <FileText size={20} /><span><strong>{file?.name || 'Añadir un PDF o PowerPoint'}</strong><small>{file ? 'Listo para usar' : 'Opcional · máximo 25 MB'}</small></span>
+      <div className="mode-toggle" role="group" aria-label="Modo de sesión">
+        <button type="button" className={sessionMode === 'class' ? 'active' : ''} onClick={() => setSessionMode('class')}><strong>Clase</strong><small>Sin diapositivas, con preguntas de práctica</small></button>
+        <button type="button" className={sessionMode === 'presentation' ? 'active' : ''} onClick={() => setSessionMode('presentation')}><strong>Presentación</strong><small>Doble pantalla con guion en vivo</small></button>
+        <button type="button" className={sessionMode === 'reunion' ? 'active' : ''} onClick={() => setSessionMode('reunion')}><strong>Reunión</strong><small>No presentas nada: solo transcripción y traducción</small></button>
+      </div>
+      {sessionMode === 'presentation' && <label className="file-field">Archivo de la presentación <span className="file-picker">
+        <FileText size={20} /><span><strong>{file?.name || 'Añadir un PDF'}</strong><small>{file ? 'Listo para usar' : 'Obligatorio · solo PDF · máximo 25 MB'}</small></span>
         <span className="file-action"><Upload size={15} /> Buscar</span>
-        <input aria-label="Archivo de la presentación" type="file" accept=".pdf,.pptx" onChange={event => setFile(event.target.files?.[0] || null)} />
-      </span><small className="document-privacy">Primero se lee el texto localmente. Si un PDF está escaneado, se envía de forma segura a Gemini para aplicar OCR visual.</small></label>
+        <input aria-label="Archivo de la presentación" type="file" accept=".pdf" onChange={event => setFile(event.target.files?.[0] || null)} />
+      </span><small className="document-privacy">El modo presentación necesita texto seleccionable en el PDF: se usa para mostrarlo en pantalla y generar el guion por diapositiva.</small></label>}
       <details className="optional-fields">
         <summary>Contexto adicional <span>Opcional</span><ChevronDown size={17} /></summary>
         <div className="optional-content">
@@ -199,22 +441,79 @@ function Prepare() {
         </div>
       </details>
       {error && <p className="form-error"><AlertTriangle size={16} />{error}</p>}
-      <button className="primary-button full-button" onClick={prepareClick} disabled={!title.trim() || preparing}>{preparing ? 'Preparando…' : 'Preparar sesión'} {!preparing && <ArrowRight size={17} />}</button>
+      <div className="prepare-actions">
+        <button className="primary-button full-button" onClick={prepareClick} disabled={!title.trim() || preparing || (sessionMode === 'presentation' && !file)}>{preparing ? (prepareStep || 'Preparando…') : 'Preparar sesión'} {!preparing && <ArrowRight size={17} />}</button>
+        {preparing && <button className="secondary-button" onClick={cancelPreparing}>Cancelar</button>}
+      </div>
     </section>
-    {savedSessions.length > 0 && <details className="saved-sessions"><summary>Sesiones recientes <span>{savedSessions.length}</span><ChevronDown size={17} /></summary><div>{savedSessions.slice().reverse().slice(0, 5).map(session => <div className="saved-session-row" key={session.id}><button className="session-open" disabled={restoring} onClick={() => void restoreSavedSession(session)}><span>{session.title}</span><small>{audienceLabel(session.audience)} · {session.level}</small><ArrowRight size={15} /></button><button className="session-delete" disabled={restoring} onClick={() => void removeSavedSession(session.id)} aria-label={`Eliminar ${session.title}`}>Eliminar</button></div>)}</div></details>}
+    {savedSessions.length > 0 && <details className="saved-sessions"><summary>Sesiones recientes <span>{savedSessions.length}</span><ChevronDown size={17} /></summary><div>{savedSessions.slice().reverse().slice(0, 5).map(session => <div className="saved-session-row" key={session.id}><button className="session-open" disabled={restoring} onClick={() => void restoreSavedSession(session)}><span>{session.title}</span><small>{audienceLabel(session.audience)} · {session.level}</small><ArrowRight size={15} /></button><button className="session-delete" disabled={restoring} onClick={() => setPendingDelete(session)} aria-label={`Eliminar ${session.title}`}>Eliminar</button></div>)}</div></details>}
+    {pendingDelete && <ConfirmDialog title="Eliminar sesión guardada" message={`Esto elimina "${pendingDelete.title}" y su transcripción guardada. No se puede deshacer.`} confirmLabel="Eliminar" danger busy={deleting} onConfirm={() => void confirmRemoveSession()} onCancel={() => setPendingDelete(null)} />}
   </div>;
 }
 
 function Practice() {
-  const { setScreen, startLive, practiceQuestions } = useStore();
+  const { setScreen, startLive, practiceQuestions, sessionMode, slidePages } = useStore();
   const [selected, setSelected] = useState(0);
   const selectedItem = practiceQuestions[selected];
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [monitors, setMonitors] = useState<MonitorInfo[] | null>(null);
+  const [selectedMonitor, setSelectedMonitor] = useState(0);
+  const [starting, setStarting] = useState(false);
+  const [pickerError, setPickerError] = useState('');
+
+  const goLive = async () => {
+    if (sessionMode !== 'presentation') { startLive(false); setScreen('live'); return; }
+    setPickerOpen(true); setPickerError('');
+    try {
+      const list = await listMonitors();
+      setMonitors(list);
+      setSelectedMonitor(list.length > 1 ? 1 : 0);
+      void identifyMonitors();
+    } catch (cause) {
+      setPickerError(cause instanceof Error ? cause.message : 'No se pudieron detectar los monitores.');
+    }
+  };
+
+  const confirmMonitor = async () => {
+    if (!presentationFileBytes || !slidePages.length) {
+      setPickerError('Falta el PDF de la presentación. Vuelve a Preparar.');
+      return;
+    }
+    setStarting(true); setPickerError('');
+    try {
+      await setPresentationPdf(presentationFileBytes);
+      await openPresenterWindow(selectedMonitor);
+      presentationMonitorIndex = selectedMonitor;
+      setPickerOpen(false);
+      startLive(false);
+      setScreen('live');
+    } catch (cause) {
+      setPickerError(cause instanceof Error ? cause.message : 'No se pudo abrir la ventana de presentación.');
+    } finally {
+      setStarting(false);
+    }
+  };
+
   return <div className="page practice-page">
     <div className="page-heading compact-heading"><p className="overline">Práctica</p><h1>Preguntas probables</h1><p>Selecciona una pregunta y practica la respuesta corta en inglés.</p></div>
     <div className="practice-grid">
       <section className="question-list card" aria-label="Preguntas probables">{practiceQuestions.length ? practiceQuestions.map((item, index) => <button key={`${item.question}-${index}`} className={selected === index ? 'selected' : ''} onClick={() => setSelected(index)}><span>{item.question}</span><ArrowRight size={16} /></button>) : <p className="empty-copy practice-empty">Prepara una sesión para generar preguntas basadas en tu presentación.</p>}</section>
-      <section className="practice-answer card"><p className="overline">Di esto en inglés</p><h2>{selectedItem?.question || 'Aquí aparecerán tus respuestas de práctica.'}</h2><p className="answer-text">{selectedItem?.answer || 'Primero añade tu presentación y el contexto para que Voxa prepare preguntas realistas.'}</p><button className="primary-button full-button" disabled={!practiceQuestions.length} onClick={() => { startLive(false); setScreen('live'); }}>Empezar a escuchar <Radio size={17} /></button></section>
+      <section className="practice-answer card"><p className="overline">Di esto en inglés</p><h2>{selectedItem?.question || 'Aquí aparecerán tus respuestas de práctica.'}</h2><p className="answer-text">{selectedItem?.answer || 'Primero añade tu presentación y el contexto para que Voxa prepare preguntas realistas.'}</p><button className="primary-button full-button" disabled={!practiceQuestions.length} onClick={() => void goLive()}>Empezar a escuchar <Radio size={17} /></button></section>
     </div>
+    {pickerOpen && <div className="modal-backdrop" onClick={() => !starting && setPickerOpen(false)}>
+      <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="monitor-picker-title" onClick={event => event.stopPropagation()}>
+        <div className="modal-head"><div><p className="overline">Modo presentación</p><h2 id="monitor-picker-title">Elige la pantalla pública</h2></div><button className="icon-button" aria-label="Cerrar selector de monitor" onClick={() => setPickerOpen(false)} disabled={starting}>×</button></div>
+        <p className="supporting">Esa pantalla mostrará el PDF a pantalla completa (la que compartes por Zoom/Teams). El resto se queda como tu ventana de control con el guion. Cada monitor muestra brevemente su número — igual que "Identificar" en Windows.</p>
+        {monitors === null && !pickerError && <p className="empty-copy">Detectando monitores…</p>}
+        {monitors && <div className="monitor-list">{monitors.map(monitor => <button key={monitor.index} type="button" className={`monitor-option ${selectedMonitor === monitor.index ? 'selected' : ''}`} onClick={() => setSelectedMonitor(monitor.index)}><span className="monitor-badge">{monitor.index + 1}</span><MonitorIcon size={18} /><span><strong>{monitor.name}</strong><small>{monitor.width}×{monitor.height}</small></span></button>)}</div>}
+        {monitors && <button type="button" className="secondary-button" onClick={() => void identifyMonitors()}>Identificar pantallas de nuevo</button>}
+        {pickerError && <p className="form-error"><AlertTriangle size={16} />{pickerError}</p>}
+        <div className="modal-actions">
+          <button className="secondary-button" onClick={() => setPickerOpen(false)} disabled={starting}>Cancelar</button>
+          <button className="primary-button" disabled={!monitors || starting} onClick={() => void confirmMonitor()}>{starting ? 'Abriendo…' : 'Empezar presentación'}</button>
+        </div>
+      </section>
+    </div>}
   </div>;
 }
 
@@ -278,6 +577,10 @@ function LiveAudioBridge() {
           const store = useStore.getState();
           store.updateTurn(turnId, { translation: analysis.translation, sourceLanguage: analysis.source_language, translating: false });
           store.addAnswerCost(answerCost(analysis));
+          // Reunión mode is transcription/translation only - there is no
+          // presenter to hand a suggested answer to, so skip question
+          // detection entirely rather than queuing answers nobody sees.
+          if (store.sessionMode === 'reunion') return;
           const question = analysis.complete && (analysis.intent === 'QUESTION' || analysis.intent === 'REQUEST') ? analysis.normalized_question?.trim() : '';
           if (transcript.speaker !== 'THEM' || !question) return;
           const current = useStore.getState();
@@ -302,6 +605,11 @@ function LiveAudioBridge() {
         onAudioLevel(level => { if (mounted) useStore.getState().setAudioSource(level.speaker, { level: Math.min(1, level.rms * 8), active: level.active }); }),
         onUsageUpdate(usage => { if (mounted) useStore.getState().setLiveUsage(usage.speaker, { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens }); }),
         onTranscriptionStatus(status => { if (mounted) useStore.getState().setAudioSource(status.speaker, status.error ? { transcription: 'error', error: status.error } : { transcription: 'connected', error: undefined }); }),
+        onAudioDeviceChanged(change => {
+          if (!mounted) return;
+          useStore.getState().setAudioSource('ME', { device: change.microphoneName });
+          useStore.getState().setAudioSource('THEM', { device: change.loopbackName });
+        }),
       ]);
       cleanups.push(...listeners);
       if (sessionId) await startNativeSession(sessionId);
@@ -327,13 +635,38 @@ function applyCaptureStatus(status: CaptureStatus) {
 }
 
 function Live() {
-  const { answer, answerLoading, answerError, activeQuestion, questionQueue, answerCostUsd, liveUsage, turns, interimTranscripts, paused, setPaused, setAnswerText, removeQueuedQuestion, endLive, capturePhase, captureError, audioSources, sessionId, sessionTitle } = useStore();
+  const { answer, answerLoading, answerError, activeQuestion, questionQueue, answerCostUsd, liveUsage, turns, interimTranscripts, paused, setPaused, setAnswerText, removeQueuedQuestion, endLive, capturePhase, captureError, audioSources, sessionId, sessionTitle, sessionMode, slidePages, slideScripts, introScript, outroScript, currentSlideIndex, setCurrentSlideIndex, presentationPhase, setPresentationPhase, presentationFinished, setPresentationFinished } = useStore();
   const [sourceEnabled, setSourceEnabled] = useState<Record<'ME' | 'THEM', boolean>>({ ME: true, THEM: true });
   const [activeSeconds, setActiveSeconds] = useState<Record<'ME' | 'THEM', number>>({ ME: 0, THEM: 0 });
   const [sourceBusy, setSourceBusy] = useState<'ME' | 'THEM' | null>(null);
   const [variantBusy, setVariantBusy] = useState(false);
   const [transcriptOpen, setTranscriptOpen] = useState(true);
+  const [presenterOpen, setPresenterOpen] = useState(true);
+  const [reopening, setReopening] = useState(false);
   const transcriptRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (sessionMode !== 'presentation') return;
+    let mounted = true;
+    const cleanup = onPresenterClosed(() => { if (mounted) setPresenterOpen(false); });
+    return () => { mounted = false; void cleanup.then(unlisten => unlisten()); };
+  }, [sessionMode]);
+  const reopenPresenter = async () => {
+    if (!presentationFileBytes) return;
+    setReopening(true);
+    try {
+      await setPresentationPdf(presentationFileBytes);
+      await openPresenterWindow(presentationMonitorIndex);
+      setPresenterOpen(true);
+    } finally {
+      setReopening(false);
+    }
+  };
+  const restartPresentation = () => {
+    setCurrentSlideIndex(0);
+    void setSlideIndex(0);
+    setPresentationFinished(false);
+    setPresentationPhase('intro');
+  };
   const needsApiKey = audioSources.ME.transcription === 'offline' || audioSources.THEM.transcription === 'offline';
   const transcriptionError = audioSources.ME.error || audioSources.THEM.error;
   const toggleListening = async () => {
@@ -434,24 +767,92 @@ function Live() {
     };
   });
   return <div className="live-page">
-    <header className="live-header"><div className={`live-state ${capturePhase === 'error' ? 'error' : ''}`}><i /><strong>{statusText}</strong><span>El audio no se guarda · la transcripción permanece en este dispositivo</span></div><div className="live-actions"><span className="cost-badge" title={`Costo estimado de Gemini — transcripción $${transcriptionCost.toFixed(4)}, traducción y respuestas $${answerCostUsd.toFixed(4)}`}>$ ≈ {costLabel}</span>{questionQueue.length > 0 && <span className="queue-badge">{questionQueue.length} en cola</span>}<button className="secondary-button" onClick={toggleListening}>{paused ? <Play size={15} /> : <Pause size={15} />}{paused ? 'Reanudar todo' : 'Pausar todo'}</button><button className="end-button" onClick={() => { answerGeneration += 1; void stopNativeSession(); endLive(); }}>Finalizar</button></div></header>
+    <header className="live-header"><div className={`live-state ${capturePhase === 'error' ? 'error' : ''}`}><i /><strong>{statusText}</strong><span>El audio no se guarda · la transcripción permanece en este dispositivo</span></div><div className="live-actions"><span className="cost-badge" title={`Costo estimado de Gemini — transcripción $${transcriptionCost.toFixed(4)}, traducción y respuestas $${answerCostUsd.toFixed(4)}`}>$ ≈ {costLabel}</span>{questionQueue.length > 0 && <span className="queue-badge">{questionQueue.length} en cola</span>}<button className="secondary-button" onClick={toggleListening}>{paused ? <Play size={15} /> : <Pause size={15} />}{paused ? 'Reanudar todo' : 'Pausar todo'} <span className="shortcut-hint">Espacio</span></button>{sessionMode === 'presentation' && slidePages.length > 0 && <button className="secondary-button" onClick={restartPresentation}><RotateCcw size={14} /> Reiniciar exposición</button>}{sessionMode === 'presentation' && presentationFinished && slidePages.length > 0 && <button className="secondary-button" onClick={() => setPresentationFinished(false)}>Volver al guion</button>}<button className="end-button" onClick={() => { answerGeneration += 1; void stopNativeSession(); if (sessionMode === 'presentation') void closePresenterWindow(); endLive(); }}>Finalizar</button></div></header>
+    {sessionMode === 'presentation' && !presenterOpen && <div className="presenter-reopen"><span>Cerraste la pantalla pública (Esc).</span><button onClick={() => void reopenPresenter()} disabled={reopening}>{reopening ? 'Abriendo…' : 'Reabrir pantalla pública'}</button></div>}
+    {sessionMode === 'presentation' && !presentationFinished && slidePages.length > 0 && <Teleprompter slidePages={slidePages} slideScripts={slideScripts} introScript={introScript} outroScript={outroScript} currentSlideIndex={currentSlideIndex} setCurrentSlideIndex={setCurrentSlideIndex} phase={presentationPhase} setPhase={setPresentationPhase} onFinishPresentation={() => setPresentationFinished(true)} />}
     {(captureError || transcriptionError || needsApiKey) && <div className="inline-alert" role="alert"><AlertTriangle size={18} /><span><strong>{captureError ? 'Voxa no puede acceder al audio.' : transcriptionError ? 'Gemini no pudo iniciar la transcripción.' : 'El audio funciona, pero la transcripción está desactivada.'}</strong>{captureError || transcriptionError || ' Conecta Gemini para convertir el audio en texto.'}</span>{needsApiKey && <button onClick={() => window.dispatchEvent(new Event('voxa-open-settings'))}>Conectar Gemini</button>}</div>}
     <section className="audio-strip" aria-label="Estado de las fuentes de audio"><AudioSource label="Tú" icon={<Mic size={17} />} source={audioSources.ME} enabled={sourceEnabled.ME} disabled={paused || sourceBusy !== null} onToggle={() => void toggleSource('ME')} /><AudioSource label="Computador" icon={<Volume2 size={17} />} source={audioSources.THEM} enabled={sourceEnabled.THEM} disabled={paused || sourceBusy !== null} onToggle={() => void toggleSource('THEM')} /></section>
-    <section className="copilot-area" aria-live="polite">
+    {sessionMode !== 'reunion' && <section className="copilot-area" aria-live="polite">
       {answer ? <>
         <div className="question-block"><p className="overline">Te preguntaron</p><h1>{answer.questionEn}</h1><p className="translation">{answer.questionEs}</p></div>
         <article className="say-card">
           <div className="say-title"><p className="overline">Di esto en inglés</p><span className={`confidence ${answer.confidence.toLowerCase()}`}>{answer.confidence === 'HIGH' ? 'Basado en tu contexto' : answer.confidence === 'MEDIUM' ? 'Revisa los detalles' : 'Falta información'}</span></div>
           <p className="spoken-answer">{answer.answer}</p>
           {answer.warning && <p className="answer-warning"><AlertTriangle size={16} />{answer.warning}</p>}
-          <div className="answer-actions"><button disabled={variantBusy} onClick={() => void runVariant('shorter')}>Más corta</button><button disabled={variantBusy} onClick={() => void runVariant('more')}>Añadir detalle</button><button disabled={variantBusy} onClick={() => void runVariant('alternative')}>Otra respuesta</button></div>
+          <div className="answer-actions"><button disabled={variantBusy} onClick={() => void runVariant('shorter')}>Más corta <span className="shortcut-hint">Ctrl+Shift+S</span></button><button disabled={variantBusy} onClick={() => void runVariant('more')}>Añadir detalle <span className="shortcut-hint">Ctrl+Shift+M</span></button><button disabled={variantBusy} onClick={() => void runVariant('alternative')}>Otra respuesta <span className="shortcut-hint">Ctrl+Shift+A</span></button></div>
         </article>
         <details className="more-answer"><summary>Más información por si preguntan <ChevronDown size={17} /></summary><p>{answer.more}</p><small>{answer.idea}</small></details>
         {questionQueue.length > 0 && <div className="question-queue"><div><strong>{questionQueue.length} {questionQueue.length === 1 ? 'pregunta adicional' : 'preguntas adicionales'}</strong><span>Siguiente: {questionQueue[0]}</span></div><div className="queue-actions"><button className="queue-dismiss" onClick={() => removeQueuedQuestion(questionQueue[0])}>Descartar</button><button onClick={showNextQuestion}>Mostrar siguiente <ArrowRight size={14} /></button></div></div>}
       </> : <div className="waiting-state"><div className="listening-mark"><Radio size={25} /></div><h1>{answerError ? 'Respuesta no disponible' : answerLoading ? 'Preparando tu respuesta' : paused ? 'La escucha está en pausa' : 'Esperando una pregunta'}</h1><p>{answerError || (answerLoading ? activeQuestion : paused ? 'Reanuda cuando estés listo.' : 'Habla o reproduce el audio de la reunión. Los medidores de arriba deben moverse.')}</p>{answerError && activeQuestion && <button className="secondary-button retry-answer" onClick={() => void answerDetectedQuestion(activeQuestion)}>Intentar de nuevo</button>}</div>}
-    </section>
+    </section>}
     <details className="transcript-drawer" open={transcriptOpen} onToggle={event => setTranscriptOpen(event.currentTarget.open)}><summary><span>Traducción en vivo</span><small>{turns.length || interimTranscripts.ME || interimTranscripts.THEM ? `${turns.length} traducidas${interimTranscripts.ME || interimTranscripts.THEM ? ' · escuchando…' : ''}` : 'Esperando audio'} </small><ChevronDown size={17} /></summary><div className="turn-list" ref={transcriptRef}>{interimTranscripts.ME && <InterimTurn speaker="ME" text={interimTranscripts.ME} />}{interimTranscripts.THEM && <InterimTurn speaker="THEM" text={interimTranscripts.THEM} />}{turns.slice().reverse().map(turn => <TurnBubble key={turn.id} turn={turn} />)}{!turns.length && !interimTranscripts.ME && !interimTranscripts.THEM && <p className="empty-copy">Aquí aparecerán el audio transcrito y su traducción.</p>}<button className="export-button" onClick={exportTranscript} disabled={!turns.length}><FileText size={14} /> Exportar transcripción</button></div></details>
   </div>;
+}
+
+const WORDS_PER_MINUTE = 130;
+
+function estimatedSlideSeconds(scriptEn: string): number {
+  const words = scriptEn.trim().split(/\s+/).filter(Boolean).length;
+  return Math.max(8, Math.round((words / WORDS_PER_MINUTE) * 60));
+}
+
+function formatSeconds(totalSeconds: number): string {
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+function Teleprompter({ slidePages, slideScripts, introScript, outroScript, currentSlideIndex, setCurrentSlideIndex, phase, setPhase, onFinishPresentation }: { slidePages: string[]; slideScripts: SlideScriptEntry[]; introScript: SlideScriptEntry | null; outroScript: SlideScriptEntry | null; currentSlideIndex: number; setCurrentSlideIndex: (index: number) => void; phase: PresentationPhase; setPhase: (phase: PresentationPhase) => void; onFinishPresentation: () => void }) {
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const current = phase === 'intro' ? introScript : phase === 'outro' ? outroScript : slideScripts[currentSlideIndex];
+  const budgetSeconds = current ? estimatedSlideSeconds(current.scriptEn) : 0;
+  const overBudget = Boolean(current) && elapsedSeconds > budgetSeconds;
+  const onLastSlide = currentSlideIndex >= slidePages.length - 1;
+
+  useEffect(() => {
+    setElapsedSeconds(0);
+    const timer = window.setInterval(() => setElapsedSeconds(seconds => seconds + 1), 1000);
+    return () => window.clearInterval(timer);
+  }, [currentSlideIndex, phase]);
+
+  const goTo = (index: number) => {
+    setCurrentSlideIndex(index);
+    void setSlideIndex(index);
+  };
+
+  const goNext = () => {
+    if (phase === 'intro') { setPhase('slides'); return; }
+    if (phase === 'outro') { onFinishPresentation(); return; }
+    if (onLastSlide) { setPhase('outro'); return; }
+    goTo(currentSlideIndex + 1);
+  };
+  const goBack = () => {
+    if (phase === 'outro') { setPhase('slides'); return; }
+    if (phase === 'slides') {
+      if (currentSlideIndex === 0) { setPhase('intro'); return; }
+      goTo(currentSlideIndex - 1);
+    }
+  };
+
+  const headLabel = phase === 'intro' ? 'Saludo inicial' : phase === 'outro' ? 'Cierre' : `Diapositiva ${currentSlideIndex + 1} / ${slidePages.length}`;
+  const nextLabel = phase === 'intro' ? 'Empezar diapositiva 1' : phase === 'outro' ? 'Pasar a preguntas' : onLastSlide ? 'Ir al cierre' : 'Siguiente';
+
+  return <section className="teleprompter-panel" aria-label="Guion de la presentación">
+    <div className="teleprompter-head">
+      <span>{headLabel}</span>
+      {current && <span className={`teleprompter-timer ${overBudget ? 'over-budget' : ''}`}>{formatSeconds(elapsedSeconds)} / ~{formatSeconds(budgetSeconds)}</span>}
+    </div>
+    {current ? <>
+      <p className="teleprompter-script">{current.scriptEn}</p>
+      <p className="teleprompter-pronunciation">{current.pronunciation}</p>
+      <p className="teleprompter-spanish">{current.scriptEs}</p>
+    </> : <p className="teleprompter-script">Generando guion…</p>}
+    <div className="teleprompter-controls">
+      <button onClick={goBack} disabled={phase === 'intro'}><ChevronLeft size={15} /> Anterior</button>
+      <button onClick={goNext}>{nextLabel} {phase === 'outro' ? <ArrowRight size={15} /> : <ChevronRight size={15} />}</button>
+    </div>
+    <small className="teleprompter-hint">Esc en la pantalla pública para salir de pantalla completa.</small>
+  </section>;
 }
 
 function AudioSource({ label, icon, source, enabled, disabled, onToggle }: { label: string; icon: ReactNode; source: ReturnType<typeof useStore.getState>['audioSources']['ME']; enabled: boolean; disabled: boolean; onToggle: () => void }) {

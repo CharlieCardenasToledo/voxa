@@ -11,21 +11,38 @@ pub struct DocumentContext {
     pub model_used: Option<String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Per-page text, only populated for PDFs extracted locally (not via
+    /// whole-document Gemini OCR, and never for PPTX). Used to generate a
+    /// teleprompter script per slide in presentation mode.
+    pub pages: Option<Vec<String>>,
 }
 
-pub fn extract_text(file_name: &str, bytes: &[u8]) -> Result<(String, String), String> {
+pub fn extract_text(
+    file_name: &str,
+    bytes: &[u8],
+) -> Result<(String, String, Option<Vec<String>>), String> {
     let extension = file_name
         .rsplit('.')
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let (text, kind) = match extension.as_str() {
-        "pdf" => extract_pdf(bytes).map(|text| (text, "PDF".to_string()))?,
-        "pptx" => extract_pptx(bytes).map(|text| (text, "PPTX".to_string()))?,
+    let (text, kind, pages) = match extension.as_str() {
+        "pdf" => {
+            let pages = extract_pdf(bytes)?;
+            let text = pages.join(" ");
+            (text, "PDF".to_string(), Some(pages))
+        }
+        "pptx" => extract_pptx(bytes).map(|text| (text, "PPTX".to_string(), None))?,
         _ => return Err("Solo se admiten archivos PDF y PPTX".into()),
     };
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    Ok((text, kind))
+    let pages = pages.map(|pages| {
+        pages
+            .into_iter()
+            .map(|page| page.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect()
+    });
+    Ok((text, kind, pages))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -38,6 +55,7 @@ pub fn context_from_text(
     model_used: Option<String>,
     input_tokens: u64,
     output_tokens: u64,
+    pages: Option<Vec<String>>,
 ) -> Result<DocumentContext, String> {
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if text.is_empty() {
@@ -53,6 +71,7 @@ pub fn context_from_text(
         model_used,
         input_tokens,
         output_tokens,
+        pages,
     })
 }
 
@@ -65,13 +84,18 @@ pub fn needs_pdf_ocr(file_name: &str, text: &str) -> bool {
             < 200
 }
 
-fn extract_pdf(bytes: &[u8]) -> Result<String, String> {
+fn extract_pdf(bytes: &[u8]) -> Result<Vec<String>, String> {
     let document = lopdf::Document::load_mem(bytes)
         .map_err(|error| format!("No se pudo leer el PDF: {error}"))?;
     let pages = document.get_pages().keys().copied().collect::<Vec<_>>();
-    document
-        .extract_text(&pages)
-        .map_err(|error| format!("No se pudo extraer el texto del PDF: {error}"))
+    pages
+        .into_iter()
+        .map(|page| {
+            document
+                .extract_text(&[page])
+                .map_err(|error| format!("No se pudo extraer el texto del PDF: {error}"))
+        })
+        .collect()
 }
 
 fn extract_pptx(bytes: &[u8]) -> Result<String, String> {
