@@ -102,7 +102,7 @@ export async function onPresenterClosed(callback: () => void): Promise<() => voi
   return listen('presenter-closed', () => callback());
 }
 
-export type UserProfile = { name: string; professionalContext: string; vocabulary: string[] };
+export type UserProfile = { name: string; professionalContext: string; vocabulary: string[]; photoDataUrl?: string };
 
 export async function getUserProfile(): Promise<UserProfile | null> {
   if (!isTauri()) return null;

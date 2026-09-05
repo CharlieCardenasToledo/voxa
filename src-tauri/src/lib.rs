@@ -80,6 +80,8 @@ struct UserProfile {
     professional_context: String,
     #[serde(default)]
     vocabulary: Vec<String>,
+    #[serde(default)]
+    photo_data_url: String,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
