@@ -27,3 +27,8 @@ __pycache__/
 .idea/
 Thumbs.db
 .DS_Store
+
+# Secrets — never commit a Gemini API key or similar
+.env
+.env.*
+!.env.example

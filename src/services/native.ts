@@ -105,7 +105,10 @@ export async function onPresenterClosed(callback: () => void): Promise<() => voi
 export type UserProfile = { name: string; professionalContext: string; vocabulary: string[]; photoDataUrl?: string };
 
 export async function getUserProfile(): Promise<UserProfile | null> {
-  if (!isTauri()) return null;
+  // Browser/dev preview: a benign empty profile instead of null, so the
+  // onboarding modal (shown only when a profile has never been saved) doesn't
+  // block every local preview of the app outside the real Tauri shell.
+  if (!isTauri()) return { name: '', professionalContext: '', vocabulary: [] };
   return invoke<UserProfile | null>('get_user_profile');
 }
 
@@ -144,9 +147,17 @@ export type AudioLevel = { speaker: 'ME' | 'THEM'; rms: number; peak: number; ac
 export type TranscriptionStatus = { speaker: 'ME' | 'THEM'; state?: 'connecting' | 'connected'; error?: string };
 export type UsageUpdate = { speaker: 'ME' | 'THEM'; inputTokens: number; outputTokens: number; totalTokens: number };
 
-export async function startAudioCapture(): Promise<CaptureStatus> {
-  if (!isTauri()) return { microphone: true, loopback: true, running: false, error: null, microphone_name: 'Browser microphone', loopback_name: 'Browser audio' };
-  return invoke('start_audio_capture');
+export type AudioDeviceInfo = { name: string; isDefault: boolean };
+export type AudioDeviceList = { inputs: AudioDeviceInfo[]; outputs: AudioDeviceInfo[] };
+
+export async function listAudioDevices(): Promise<AudioDeviceList> {
+  if (!isTauri()) return { inputs: [{ name: 'Micrófono del navegador', isDefault: true }], outputs: [{ name: 'Altavoces del navegador', isDefault: true }] };
+  return invoke<AudioDeviceList>('list_audio_devices');
+}
+
+export async function startAudioCapture(micName?: string | null, loopbackName?: string | null): Promise<CaptureStatus> {
+  if (!isTauri()) return { microphone: true, loopback: true, running: false, error: null, microphone_name: micName || 'Browser microphone', loopback_name: loopbackName || 'Browser audio' };
+  return invoke('start_audio_capture', { micName: micName || null, loopbackName: loopbackName || null });
 }
 
 export async function stopAudioCapture(): Promise<void> {

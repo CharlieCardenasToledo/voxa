@@ -202,6 +202,19 @@ fn check_system() -> AudioDevices {
     }
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AudioDeviceList {
+    inputs: Vec<capture::AudioDeviceInfo>,
+    outputs: Vec<capture::AudioDeviceInfo>,
+}
+
+#[tauri::command]
+fn list_audio_devices() -> Result<AudioDeviceList, String> {
+    let (inputs, outputs) = capture::list_devices()?;
+    Ok(AudioDeviceList { inputs, outputs })
+}
+
 #[tauri::command]
 fn prepare_session(
     app: AppHandle,
@@ -447,6 +460,8 @@ fn stop_live_session(state: State<'_, RuntimeState>) -> Result<(), String> {
 fn start_audio_capture(
     app: AppHandle,
     state: State<'_, RuntimeState>,
+    mic_name: Option<String>,
+    loopback_name: Option<String>,
 ) -> Result<capture::CaptureStatus, String> {
     let mut slot = state
         .capture_stop
@@ -476,17 +491,25 @@ fn start_audio_capture(
     let hub_for_callback = hub.clone();
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<capture::CaptureCommand>();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(String, String), String>>();
+    // Kept for the whole thread's lifetime: `None` means "follow the OS
+    // default", an explicit name means the user picked that device and the
+    // hot-swap check below must not fight their choice.
+    let requested_mic = mic_name;
+    let requested_loopback = loopback_name;
     std::thread::spawn(move || {
         // Reused whenever the OS default input/output device changes mid-session
-        // (e.g. connecting Bluetooth headphones), since cpal streams stay bound
-        // to whatever device was default at the moment they were opened.
+        // (e.g. connecting Bluetooth headphones) while a source is set to
+        // "predeterminado", since cpal streams stay bound to whatever device
+        // was default at the moment they were opened.
         let build_engine = {
             let handle = handle.clone();
             let hub_for_callback = hub_for_callback.clone();
+            let requested_mic = requested_mic.clone();
+            let requested_loopback = requested_loopback.clone();
             move || {
                 let handle = handle.clone();
                 let hub_for_callback = hub_for_callback.clone();
-                capture::AudioCapture::start(move |speaker, pcm, ended| {
+                capture::AudioCapture::start(requested_mic.clone(), requested_loopback.clone(), move |speaker, pcm, ended| {
                     if let Some(hub) = &hub_for_callback {
                         hub.push(speaker, pcm.clone(), ended);
                     }
@@ -515,12 +538,23 @@ fn start_audio_capture(
                     let _ = reply.send(engine.set_source_enabled(&speaker, enabled));
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    let current = capture::default_status();
-                    let (mic_name, loopback_name) = engine.device_names();
-                    let mic_changed = current.microphone_name.as_deref() != Some(mic_name.as_str());
-                    let loopback_changed =
-                        current.loopback_name.as_deref() != Some(loopback_name.as_str());
-                    if mic_changed || loopback_changed {
+                    let (engine_mic, engine_loopback) = engine.device_names();
+                    let mut should_rebuild = false;
+                    if requested_mic.is_none() {
+                        if let Some(default_mic) = capture::default_input_name() {
+                            if default_mic != engine_mic {
+                                should_rebuild = true;
+                            }
+                        }
+                    }
+                    if requested_loopback.is_none() {
+                        if let Some(default_loopback) = capture::default_output_name() {
+                            if default_loopback != engine_loopback {
+                                should_rebuild = true;
+                            }
+                        }
+                    }
+                    if should_rebuild {
                         if let Ok(new_engine) = build_engine() {
                             let (new_mic, new_loopback) = new_engine.device_names();
                             engine = new_engine;
@@ -1767,6 +1801,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             check_system,
+            list_audio_devices,
             prepare_session,
             extract_document,
             start_live_session,

@@ -1,0 +1,24 @@
+name: Solicitud de funcionalidad
+description: Propón una idea o mejora para Voxa.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: ¿Qué problema resuelve?
+      description: Describe la situación o limitación actual que te gustaría que se resolviera.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Solución propuesta
+      description: Describe cómo imaginas que funcionaría.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternativas consideradas
+      description: ¿Hay alguna otra forma de resolver esto que hayas considerado?

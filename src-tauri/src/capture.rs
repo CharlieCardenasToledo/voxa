@@ -17,6 +17,65 @@ pub struct CaptureStatus {
     pub loopback_name: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioDeviceInfo {
+    pub name: String,
+    pub is_default: bool,
+}
+
+pub fn default_input_name() -> Option<String> {
+    cpal::default_host()
+        .default_input_device()
+        .and_then(|device| device.name().ok())
+}
+
+pub fn default_output_name() -> Option<String> {
+    cpal::default_host()
+        .default_output_device()
+        .and_then(|device| device.name().ok())
+}
+
+/// Enumerates every input (microphone) and output (used for loopback capture)
+/// device the OS host reports, flagging whichever one is currently the
+/// system default so the picker can preselect it.
+pub fn list_devices() -> Result<(Vec<AudioDeviceInfo>, Vec<AudioDeviceInfo>), String> {
+    let host = cpal::default_host();
+    let default_input = default_input_name();
+    let default_output = default_output_name();
+    let inputs = host
+        .input_devices()
+        .map_err(|error| error.to_string())?
+        .filter_map(|device| device.name().ok())
+        .map(|name| {
+            let is_default = Some(&name) == default_input.as_ref();
+            AudioDeviceInfo { name, is_default }
+        })
+        .collect();
+    let outputs = host
+        .output_devices()
+        .map_err(|error| error.to_string())?
+        .filter_map(|device| device.name().ok())
+        .map(|name| {
+            let is_default = Some(&name) == default_output.as_ref();
+            AudioDeviceInfo { name, is_default }
+        })
+        .collect();
+    Ok((inputs, outputs))
+}
+
+fn find_input_device(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
+    host.input_devices()
+        .ok()?
+        .find(|device| device.name().map(|n| n == name).unwrap_or(false))
+}
+
+fn find_output_device(host: &cpal::Host, name: &str) -> Option<cpal::Device> {
+    host.output_devices()
+        .ok()?
+        .find(|device| device.name().map(|n| n == name).unwrap_or(false))
+}
+
 pub struct AudioCapture {
     _mic: cpal::Stream,
     _loopback: cpal::Stream,
@@ -26,14 +85,23 @@ pub struct AudioCapture {
 
 impl AudioCapture {
     pub fn start(
+        mic_name: Option<String>,
+        loopback_name: Option<String>,
         on_chunk: impl Fn(&'static str, Vec<u8>, bool) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let host = cpal::default_host();
-        let microphone = host
-            .default_input_device()
+        // An explicit selection is looked up by name first; if it's absent (or
+        // has disappeared, e.g. unplugged) this falls back to the OS default
+        // rather than failing outright.
+        let microphone = mic_name
+            .as_deref()
+            .and_then(|name| find_input_device(&host, name))
+            .or_else(|| host.default_input_device())
             .ok_or("No default microphone found")?;
-        let output = host
-            .default_output_device()
+        let output = loopback_name
+            .as_deref()
+            .and_then(|name| find_output_device(&host, name))
+            .or_else(|| host.default_output_device())
             .ok_or("No default output device found")?;
         let microphone_name = microphone
             .name()
