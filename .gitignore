@@ -19,6 +19,8 @@ src-tauri/.pyinstaller/
 # Local tooling
 .rtfm/
 .claude/
+__pycache__/
+*.py[cod]
 
 # Editor / OS
 .vscode/

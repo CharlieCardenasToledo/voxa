@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { AlertTriangle, ArrowRight, ChevronDown, ChevronLeft, ChevronRight, FileText, Mic, Monitor as MonitorIcon, Pause, Play, Radio, RotateCcw, Settings2, Upload, Volume2 } from 'lucide-react';
 import { useStore, type PresentationPhase, type Screen, type SessionMode, type SlideScriptEntry, type Turn } from './store';
 import { analyzeTranscript, checkGeminiHealth, checkSystem, closePresenterWindow, deleteSession, extractDocument, generateAnswerVariant, generateCopilotAnswer, generateSlideScripts, getAppInfo, getUsageStats, getUserProfile, identifyMonitors, isNativeRuntime, listMonitors, loadPresentationPdf, loadSessions, onAudioDeviceChanged, onAudioLevel, onNativeTranscript, onPresenterClosed, onTranscriptionStatus, onUsageUpdate, openPresenterWindow, prepareNativeSession, resetUsageStats, restoreSession, savePresentationDeck, savePresentationPdf, saveUserProfile, setAudioSourceEnabled, setGeminiApiKey, setPresentationPdf, setSlideIndex, startAudioCapture, startNativeSession, stopAudioCapture, stopNativeSession, validateGeminiApiKey, type AppInfo, type CaptureStatus, type GeminiHealthReport, type MonitorInfo, type NativeCopilotAnswer, type PrepareSessionRequest, type SavedSession, type SystemCheck, type UsageStats, type UserProfile } from './services/native';
+import { looksLikeQuestion, mergeFinalTranscript } from './services/transcript';
 
 // Holds the raw PDF bytes and the chosen monitor between Prepare/Practice
 // (where they're picked) and Live (where a closed presenter window can be
@@ -555,7 +556,64 @@ function LiveAudioBridge() {
     let mounted = true;
     let sequence = 0;
     const analysisChains: Record<'ME' | 'THEM', Promise<void>> = { ME: Promise.resolve(), THEM: Promise.resolve() };
+    const finalBuffers: Record<'ME' | 'THEM', string> = { ME: '', THEM: '' };
+    const finalTimers: Record<'ME' | 'THEM', number | null> = { ME: null, THEM: null };
     const cleanups: (() => void)[] = [];
+
+    const offerQuestion = (question: string) => {
+      const normalized = question.trim();
+      if (!normalized) return;
+      const current = useStore.getState();
+      if (current.sessionMode === 'reunion') return;
+      const folded = normalized.toLocaleLowerCase();
+      const duplicate = current.activeQuestion?.trim().toLocaleLowerCase() === folded
+        || current.questionQueue.some(item => item.trim().toLocaleLowerCase() === folded);
+      if (duplicate) return;
+      if (current.activeQuestion || current.answerLoading || current.answer) current.enqueueQuestion(normalized);
+      else void answerDetectedQuestion(normalized);
+    };
+
+    const commitFinalTranscript = (speaker: 'ME' | 'THEM', text: string) => {
+      if (!mounted || !text) return;
+      const now = new Date();
+      const turnId = `${Date.now()}-${sequence++}-${speaker}`;
+      useStore.getState().addTurn({ id: turnId, speaker, text, translating: true, time: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) });
+      const analyze = async () => {
+        if (!mounted) return;
+        const recentConversation = useStore.getState().turns.slice(-20).map(turn => `[${turn.speaker}] ${turn.text}`).join('\n');
+        try {
+          const analysis = await analyzeTranscript(text, speaker, recentConversation);
+          if (!mounted) return;
+          if (!analysis) {
+            useStore.getState().updateTurn(turnId, { translating: false });
+            if (speaker === 'THEM' && looksLikeQuestion(text)) offerQuestion(text);
+            return;
+          }
+          const store = useStore.getState();
+          store.updateTurn(turnId, { translation: analysis.translation, sourceLanguage: analysis.source_language, translating: false });
+          store.addAnswerCost(answerCost(analysis));
+          // Reunión mode is transcription/translation only - there is no
+          // presenter to hand a suggested answer to, so skip question
+          // detection entirely rather than queuing answers nobody sees.
+          if (store.sessionMode === 'reunion') return;
+          if (speaker !== 'THEM') return;
+          const classified = analysis.complete && (analysis.intent === 'QUESTION' || analysis.intent === 'REQUEST')
+            ? analysis.normalized_question?.trim()
+            : '';
+          // A conservative local fallback prevents a transient classifier
+          // failure or an incorrect "incomplete" label from losing an
+          // obvious audience question.
+          if (classified) offerQuestion(classified);
+          else if (looksLikeQuestion(text)) offerQuestion(text);
+        } catch (error) {
+          if (mounted) useStore.getState().updateTurn(turnId, { translating: false });
+          if (mounted && speaker === 'THEM' && looksLikeQuestion(text)) offerQuestion(text);
+          console.error('Live translation unavailable', error);
+        }
+      };
+      analysisChains[speaker] = analysisChains[speaker].then(analyze, analyze);
+    };
+
     const handleTranscript = (transcript: Parameters<Parameters<typeof onNativeTranscript>[0]>[0]) => {
       if (!mounted) return;
       const text = transcript.text.trim();
@@ -565,36 +623,14 @@ function LiveAudioBridge() {
         return;
       }
       useStore.getState().setInterimTranscript(transcript.speaker, '');
-      const now = new Date();
-      const turnId = `${Date.now()}-${sequence++}-${transcript.speaker}`;
-      useStore.getState().addTurn({ id: turnId, speaker: transcript.speaker, text, translating: true, time: now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) });
-      const analyze = async () => {
-        if (!mounted) return;
-        const recentConversation = useStore.getState().turns.slice(-20).map(turn => `[${turn.speaker}] ${turn.text}`).join('\n');
-        try {
-          const analysis = await analyzeTranscript(text, transcript.speaker, recentConversation);
-          if (!mounted || !analysis) return;
-          const store = useStore.getState();
-          store.updateTurn(turnId, { translation: analysis.translation, sourceLanguage: analysis.source_language, translating: false });
-          store.addAnswerCost(answerCost(analysis));
-          // Reunión mode is transcription/translation only - there is no
-          // presenter to hand a suggested answer to, so skip question
-          // detection entirely rather than queuing answers nobody sees.
-          if (store.sessionMode === 'reunion') return;
-          const question = analysis.complete && (analysis.intent === 'QUESTION' || analysis.intent === 'REQUEST') ? analysis.normalized_question?.trim() : '';
-          if (transcript.speaker !== 'THEM' || !question) return;
-          const current = useStore.getState();
-          const duplicate = current.activeQuestion?.toLocaleLowerCase() === question.toLocaleLowerCase() || current.questionQueue[current.questionQueue.length - 1]?.toLocaleLowerCase() === question.toLocaleLowerCase();
-          if (!duplicate) {
-            if (current.activeQuestion || current.answerLoading || current.answer) current.enqueueQuestion(question);
-            else void answerDetectedQuestion(question);
-          }
-        } catch (error) {
-          if (mounted) useStore.getState().updateTurn(turnId, { translating: false });
-          console.error('Live translation unavailable', error);
-        }
-      };
-      analysisChains[transcript.speaker] = analysisChains[transcript.speaker].then(analyze, analyze);
+      finalBuffers[transcript.speaker] = mergeFinalTranscript(finalBuffers[transcript.speaker], text);
+      if (finalTimers[transcript.speaker] !== null) window.clearTimeout(finalTimers[transcript.speaker]!);
+      finalTimers[transcript.speaker] = window.setTimeout(() => {
+        const combined = finalBuffers[transcript.speaker];
+        finalBuffers[transcript.speaker] = '';
+        finalTimers[transcript.speaker] = null;
+        commitFinalTranscript(transcript.speaker, combined);
+      }, 250);
     };
     const start = async () => {
       useStore.getState().setCapture('starting');
@@ -604,16 +640,30 @@ function LiveAudioBridge() {
         onNativeTranscript(handleTranscript),
         onAudioLevel(level => { if (mounted) useStore.getState().setAudioSource(level.speaker, { level: Math.min(1, level.rms * 8), active: level.active }); }),
         onUsageUpdate(usage => { if (mounted) useStore.getState().setLiveUsage(usage.speaker, { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens }); }),
-        onTranscriptionStatus(status => { if (mounted) useStore.getState().setAudioSource(status.speaker, status.error ? { transcription: 'error', error: status.error } : { transcription: 'connected', error: undefined }); }),
+        onTranscriptionStatus(status => {
+          if (!mounted) return;
+          useStore.getState().setAudioSource(
+            status.speaker,
+            status.error
+              ? { transcription: 'error', error: status.error }
+              : { transcription: status.state || 'connected', error: undefined },
+          );
+        }),
         onAudioDeviceChanged(change => {
           if (!mounted) return;
           useStore.getState().setAudioSource('ME', { device: change.microphoneName });
           useStore.getState().setAudioSource('THEM', { device: change.loopbackName });
         }),
       ]);
+      if (!mounted) {
+        listeners.forEach(cleanup => cleanup());
+        return;
+      }
       cleanups.push(...listeners);
       if (sessionId) await startNativeSession(sessionId);
+      if (!mounted) return;
       const status = await startAudioCapture();
+      if (!mounted) return;
       applyCaptureStatus(status);
       if (!(await checkSystem()).apiConfigured) {
         const patch = { transcription: 'offline' as const, error: 'Conecta Gemini para activar la transcripción.' };
@@ -622,7 +672,16 @@ function LiveAudioBridge() {
       }
     };
     start().catch(error => { if (mounted) useStore.getState().setCapture('error', error instanceof Error ? error.message : String(error)); });
-    return () => { mounted = false; answerGeneration += 1; cleanups.forEach(cleanup => cleanup()); useStore.getState().setCapture('stopped'); void stopAudioCapture(); };
+    return () => {
+      mounted = false;
+      answerGeneration += 1;
+      for (const speaker of ['ME', 'THEM'] as const) {
+        if (finalTimers[speaker] !== null) window.clearTimeout(finalTimers[speaker]!);
+      }
+      cleanups.forEach(cleanup => cleanup());
+      useStore.getState().setCapture('stopped');
+      void stopAudioCapture();
+    };
   }, [sessionId]);
   return null;
 }

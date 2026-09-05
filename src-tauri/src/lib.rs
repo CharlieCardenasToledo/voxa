@@ -3,6 +3,7 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::{fs, time::Duration};
+use tauri::ipc::{InvokeBody, Request as IpcRequest, Response as IpcResponse};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 mod audio;
 mod capture;
@@ -332,10 +333,11 @@ fn prepare_session(
 #[tauri::command]
 fn extract_document(
     app: AppHandle,
-    file_name: String,
-    bytes: Vec<u8>,
+    request: IpcRequest<'_>,
     state: State<'_, RuntimeState>,
 ) -> Result<document::DocumentContext, String> {
+    let file_name = decoded_header(&request, "x-voxa-file-name")?;
+    let bytes = raw_ipc_body(&request)?;
     if bytes.len() > 25 * 1024 * 1024 {
         return Err("La presentación supera el límite de 25 MB".into());
     }
@@ -394,6 +396,30 @@ fn extract_document(
     Ok(context)
 }
 
+fn raw_ipc_body(request: &IpcRequest<'_>) -> Result<Vec<u8>, String> {
+    match request.body() {
+        InvokeBody::Raw(bytes) => Ok(bytes.clone()),
+        InvokeBody::Json(_) => Err("Se esperaba un archivo binario".into()),
+    }
+}
+
+fn decoded_header(request: &IpcRequest<'_>, name: &str) -> Result<String, String> {
+    let encoded = request
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| format!("Falta el encabezado {name}"))?;
+    if encoded.len() % 2 != 0 {
+        return Err(format!("El encabezado {name} no es válido"));
+    }
+    let bytes = (0..encoded.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&encoded[index..index + 2], 16))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| format!("El encabezado {name} no es válido"))?;
+    String::from_utf8(bytes).map_err(|_| format!("El encabezado {name} no es texto UTF-8"))
+}
+
 #[tauri::command]
 fn start_live_session(session_id: String, state: State<'_, RuntimeState>) -> Result<(), String> {
     if session_id.trim().is_empty() {
@@ -437,19 +463,12 @@ fn start_audio_capture(
         .lock()
         .map_err(|_| "Document state is unavailable".to_string())?
         .clone();
+    // Do not make a separate blocking models request before capture. The Live
+    // handshake validates the same key and reports its own actionable error;
+    // pre-validation added avoidable startup latency and could consume the
+    // first question before the audio streams existed.
     let hub = match gemini_key() {
-        Ok(key) => match validate_gemini_key_value(&key) {
-            Ok(()) => Some(live::LiveHub::start(app.clone(), key, vocabulary)),
-            Err(error) => {
-                for speaker in ["ME", "THEM"] {
-                    let _ = app.emit(
-                        "transcription-error",
-                        serde_json::json!({"speaker":speaker,"error":error}),
-                    );
-                }
-                None
-            }
-        },
+        Ok(key) => Some(live::LiveHub::start(app.clone(), key, vocabulary)),
         Err(_) => None,
     };
     let hub_for_callback = hub.clone();
@@ -870,19 +889,34 @@ fn presentations_dir(app: &AppHandle) -> Result<std::path::PathBuf, String> {
     Ok(dir)
 }
 
+fn presentation_path(app: &AppHandle, id: &str) -> Result<std::path::PathBuf, String> {
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|character| character.is_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err("El identificador de la sesión no es válido".into());
+    }
+    Ok(presentations_dir(app)?.join(format!("{id}.pdf")))
+}
+
 /// The PDF itself is kept out of sessions.json (which stays a single JSON
 /// array parsed whole on every load) and written as its own file instead, so
 /// history stays fast to load even with many saved presentations.
 #[tauri::command]
-fn save_presentation_pdf(app: AppHandle, id: String, bytes: Vec<u8>) -> Result<(), String> {
-    let path = presentations_dir(&app)?.join(format!("{id}.pdf"));
+fn save_presentation_pdf(app: AppHandle, request: IpcRequest<'_>) -> Result<(), String> {
+    let id = decoded_header(&request, "x-voxa-session-id")?;
+    let bytes = raw_ipc_body(&request)?;
+    let path = presentation_path(&app, &id)?;
     fs::write(path, bytes).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-fn load_presentation_pdf(app: AppHandle, id: String) -> Result<Vec<u8>, String> {
-    let path = presentations_dir(&app)?.join(format!("{id}.pdf"));
-    fs::read(&path).map_err(|_| "No se encontró el PDF guardado de esta sesión".to_string())
+fn load_presentation_pdf(app: AppHandle, id: String) -> Result<IpcResponse, String> {
+    let path = presentation_path(&app, &id)?;
+    fs::read(&path)
+        .map(IpcResponse::new)
+        .map_err(|_| "No se encontró el PDF guardado de esta sesión".to_string())
 }
 
 #[tauri::command]
@@ -933,7 +967,7 @@ fn delete_session(app: AppHandle, id: String) -> Result<(), String> {
         serde_json::from_str(&fs::read_to_string(&path).map_err(|e| e.to_string())?)
             .unwrap_or_default();
     sessions.retain(|item| item.id != id);
-    let _ = fs::remove_file(presentations_dir(&app)?.join(format!("{id}.pdf")));
+    let _ = fs::remove_file(presentation_path(&app, &id)?);
     fs::write(
         path,
         serde_json::to_vec_pretty(&sessions).map_err(|e| e.to_string())?,
@@ -1258,7 +1292,14 @@ UTTERANCE:
         },
         "required": ["source_language","target_language","translation","intent","normalized_question","complete"]
     });
-    let (response, output) = structured_interaction(&prompt, schema, None)?;
+    // Classification sits on the critical live path. A long request must not
+    // block every later utterance in the per-speaker analysis queue.
+    let (response, output) = structured_interaction_input(
+        serde_json::Value::String(prompt),
+        schema,
+        None,
+        Duration::from_secs(10),
+    )?;
     let mut analysis: TranscriptAnalysis = serde_json::from_value(output)
         .map_err(|error| format!("Could not read transcript analysis: {error}"))?;
     apply_usage(
@@ -1661,7 +1702,11 @@ fn close_presenter_window(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_presentation_pdf(bytes: Vec<u8>, state: State<'_, RuntimeState>) -> Result<(), String> {
+fn set_presentation_pdf(
+    request: IpcRequest<'_>,
+    state: State<'_, RuntimeState>,
+) -> Result<(), String> {
+    let bytes = raw_ipc_body(&request)?;
     *state
         .presentation_pdf
         .lock()
@@ -1670,13 +1715,14 @@ fn set_presentation_pdf(bytes: Vec<u8>, state: State<'_, RuntimeState>) -> Resul
 }
 
 #[tauri::command]
-fn get_presentation_pdf(state: State<'_, RuntimeState>) -> Result<Vec<u8>, String> {
-    state
+fn get_presentation_pdf(state: State<'_, RuntimeState>) -> Result<IpcResponse, String> {
+    let bytes = state
         .presentation_pdf
         .lock()
         .map_err(|_| "Presentation state is unavailable".to_string())?
         .clone()
-        .ok_or_else(|| "No hay ninguna presentación cargada".to_string())
+        .ok_or_else(|| "No hay ninguna presentación cargada".to_string())?;
+    Ok(IpcResponse::new(bytes))
 }
 
 #[tauri::command]

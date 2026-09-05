@@ -6,6 +6,10 @@ export type SystemCheck = { microphone: boolean; loopback: boolean; internet: bo
 export const isNativeRuntime = () => typeof window !== 'undefined' && ('__TAURI_INTERNALS__' in window || '__TAURI__' in window);
 const isTauri = isNativeRuntime;
 
+function encodeHeaderText(value: string): string {
+  return Array.from(new TextEncoder().encode(value), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
 export async function checkSystem(): Promise<SystemCheck> {
   if (!isTauri()) return { microphone: true, loopback: true, internet: true, apiConfigured: false };
   return invoke<SystemCheck>('check_system');
@@ -25,7 +29,7 @@ export type DocumentContext = { text: string; vocabulary: string[]; kind: string
 
 export async function extractDocument(fileName: string, bytes: Uint8Array): Promise<DocumentContext> {
   if (!isTauri()) return { text: `Mock presentation context for ${fileName}`, vocabulary: [], kind: fileName.toLowerCase().endsWith('.pptx') ? 'PPTX' : 'PDF', extraction_method: 'local', ocr_used: false, warning: null, model_used: null, input_tokens: 0, output_tokens: 0, pages: fileName.toLowerCase().endsWith('.pdf') ? [`Mock slide for ${fileName}`] : null };
-  return invoke<DocumentContext>('extract_document', { fileName, bytes: Array.from(bytes) });
+  return invoke<DocumentContext>('extract_document', bytes, { headers: { 'x-voxa-file-name': encodeHeaderText(fileName) } });
 }
 
 export type SlideScript = { index: number; scriptEn: string; pronunciation: string; scriptEs: string };
@@ -46,12 +50,12 @@ export async function savePresentationDeck(id: string, pages: string[], scripts:
 }
 
 export async function savePresentationPdf(id: string, bytes: Uint8Array): Promise<void> {
-  if (isTauri()) await invoke('save_presentation_pdf', { id, bytes: Array.from(bytes) });
+  if (isTauri()) await invoke('save_presentation_pdf', bytes, { headers: { 'x-voxa-session-id': encodeHeaderText(id) } });
 }
 
 export async function loadPresentationPdf(id: string): Promise<Uint8Array> {
   if (!isTauri()) return new Uint8Array();
-  const bytes = await invoke<number[]>('load_presentation_pdf', { id });
+  const bytes = await invoke<ArrayBuffer>('load_presentation_pdf', { id });
   return new Uint8Array(bytes);
 }
 
@@ -63,12 +67,12 @@ export async function listMonitors(): Promise<MonitorInfo[]> {
 }
 
 export async function setPresentationPdf(bytes: Uint8Array): Promise<void> {
-  if (isTauri()) await invoke('set_presentation_pdf', { bytes: Array.from(bytes) });
+  if (isTauri()) await invoke('set_presentation_pdf', bytes);
 }
 
 export async function getPresentationPdf(): Promise<Uint8Array> {
   if (!isTauri()) return new Uint8Array();
-  const bytes = await invoke<number[]>('get_presentation_pdf');
+  const bytes = await invoke<ArrayBuffer>('get_presentation_pdf');
   return new Uint8Array(bytes);
 }
 
@@ -137,7 +141,7 @@ export async function stopNativeSession(): Promise<void> {
 
 export type CaptureStatus = { microphone: boolean; loopback: boolean; running: boolean; error: string | null; microphone_name: string | null; loopback_name: string | null };
 export type AudioLevel = { speaker: 'ME' | 'THEM'; rms: number; peak: number; active: boolean };
-export type TranscriptionStatus = { speaker: 'ME' | 'THEM'; state?: 'connected'; error?: string };
+export type TranscriptionStatus = { speaker: 'ME' | 'THEM'; state?: 'connecting' | 'connected'; error?: string };
 export type UsageUpdate = { speaker: 'ME' | 'THEM'; inputTokens: number; outputTokens: number; totalTokens: number };
 
 export async function startAudioCapture(): Promise<CaptureStatus> {

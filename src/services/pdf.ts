@@ -1,5 +1,5 @@
 import * as pdfjsLib from 'pdfjs-dist';
-import type { PDFDocumentProxy } from 'pdfjs-dist';
+import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist';
 // Bundled as a local asset by Vite (no CDN) so it stays same-origin under the app's CSP.
 import PdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
@@ -15,7 +15,7 @@ export async function renderPdfPage(
   canvas: HTMLCanvasElement,
   targetWidth: number,
   targetHeight: number,
-): Promise<void> {
+): Promise<RenderTask | null> {
   const page = await doc.getPage(pageNumber);
   const baseViewport = page.getViewport({ scale: 1 });
   const scale = Math.min(targetWidth / baseViewport.width, targetHeight / baseViewport.height);
@@ -23,6 +23,6 @@ export async function renderPdfPage(
   canvas.width = viewport.width;
   canvas.height = viewport.height;
   const context = canvas.getContext('2d');
-  if (!context) return;
-  await page.render({ canvasContext: context, viewport, canvas }).promise;
+  if (!context) return null;
+  return page.render({ canvasContext: context, viewport, canvas });
 }

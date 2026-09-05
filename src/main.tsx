@@ -1,9 +1,6 @@
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
-import App from './App';
-import PresenterView from './screens/PresenterView';
-import IdentifyOverlay from './screens/IdentifyOverlay';
 import './styles.css';
 import './ux.css';
 
@@ -16,11 +13,23 @@ function currentWindowLabel(): string | null {
   }
 }
 
-function rootView() {
+async function rootView() {
   const label = currentWindowLabel();
-  if (label === 'presenter') return <PresenterView />;
-  if (label?.startsWith('identify-')) return <IdentifyOverlay index={Number(label.slice('identify-'.length)) || 0} />;
+  if (label === 'presenter') {
+    const { default: PresenterView } = await import('./screens/PresenterView');
+    return <PresenterView />;
+  }
+  if (label?.startsWith('identify-')) {
+    const { default: IdentifyOverlay } = await import('./screens/IdentifyOverlay');
+    return <IdentifyOverlay index={Number(label.slice('identify-'.length)) || 0} />;
+  }
+  const { default: App } = await import('./App');
   return <App />;
 }
 
-createRoot(document.getElementById('root')!).render(<StrictMode>{rootView()}</StrictMode>);
+async function bootstrap() {
+  const view = await rootView();
+  createRoot(document.getElementById('root')!).render(<StrictMode>{view}</StrictMode>);
+}
+
+void bootstrap();

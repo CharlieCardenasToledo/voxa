@@ -46,6 +46,28 @@ def read_init() -> dict:
     return json.loads(line)
 
 
+def put_latest(
+    audio_q: "queue.Queue[tuple[str, bytes | None]]",
+    item: tuple[str, bytes | None],
+) -> None:
+    """Keep realtime audio bounded, preferring the newest audio under pressure."""
+    try:
+        audio_q.put_nowait(item)
+        return
+    except queue.Full:
+        pass
+    try:
+        audio_q.get_nowait()
+    except queue.Empty:
+        pass
+    try:
+        audio_q.put_nowait(item)
+    except queue.Full:
+        # The sender raced us and filled the slot again. Dropping one 100 ms
+        # packet is safer than blocking stdin forever and growing Rust memory.
+        pass
+
+
 def start_stdin_reader(audio_q: "queue.Queue[tuple[str, bytes | None]]") -> None:
     def run() -> None:
         for raw_line in sys.stdin:
@@ -57,15 +79,41 @@ def start_stdin_reader(audio_q: "queue.Queue[tuple[str, bytes | None]]") -> None
             except json.JSONDecodeError:
                 continue
             if "audio" in msg:
-                audio_q.put(("audio", base64.b64decode(msg["audio"])))
+                put_latest(audio_q, ("audio", base64.b64decode(msg["audio"])))
             elif msg.get("end"):
-                audio_q.put(("end", None))
+                put_latest(audio_q, ("end", None))
                 # This marks an utterance boundary, not the end of the Live
                 # session. Keep reading so later questions are transcribed.
         # stdin closed (parent stopped us): treat like an end signal.
-        audio_q.put(("end", None))
+        put_latest(audio_q, ("end", None))
 
     threading.Thread(target=run, daemon=True).start()
+
+
+async def receive_forever(session) -> None:
+    """Re-enter the SDK's per-turn iterator for the life of the connection."""
+    while True:
+        async for response in session.receive():
+            usage = getattr(response, "usage_metadata", None)
+            if usage is not None:
+                emit({
+                    "usage": {
+                        "input_tokens": getattr(usage, "prompt_token_count", 0) or 0,
+                        "output_tokens": getattr(usage, "response_token_count", 0) or 0,
+                        "total_tokens": getattr(usage, "total_token_count", 0) or 0,
+                    }
+                })
+            content = getattr(response, "server_content", None)
+            if content is None:
+                continue
+            final = getattr(content, "input_transcription", None)
+            if final and final.text:
+                emit({"transcript": final.text, "interim": False})
+                continue
+            interim = getattr(content, "interim_input_transcription", None)
+            if interim and interim.text:
+                emit({"transcript": interim.text, "interim": True})
+        await asyncio.sleep(0)
 
 
 async def run_session(init: dict, audio_q: "queue.Queue[tuple[str, bytes | None]]") -> None:
@@ -97,34 +145,28 @@ async def run_session(init: dict, audio_q: "queue.Queue[tuple[str, bytes | None]
                     await session.send_realtime_input(audio_stream_end=True)
 
         sender_task = asyncio.create_task(sender())
+        receiver_task = asyncio.create_task(receive_forever(session))
         try:
-            async for response in session.receive():
-                usage = getattr(response, "usage_metadata", None)
-                if usage is not None:
-                    emit({
-                        "usage": {
-                            "input_tokens": getattr(usage, "prompt_token_count", 0) or 0,
-                            "output_tokens": getattr(usage, "response_token_count", 0) or 0,
-                            "total_tokens": getattr(usage, "total_token_count", 0) or 0,
-                        }
-                    })
-                content = getattr(response, "server_content", None)
-                if content is None:
-                    continue
-                final = getattr(content, "input_transcription", None)
-                if final and final.text:
-                    emit({"transcript": final.text, "interim": False})
-                    continue
-                interim = getattr(content, "interim_input_transcription", None)
-                if interim and interim.text:
-                    emit({"transcript": interim.text, "interim": True})
+            done, _ = await asyncio.wait(
+                {sender_task, receiver_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in done:
+                error = task.exception()
+                if error is not None:
+                    raise error
+            raise RuntimeError("Gemini Live stream ended unexpectedly")
         finally:
             sender_task.cancel()
+            receiver_task.cancel()
+            await asyncio.gather(sender_task, receiver_task, return_exceptions=True)
 
 
 def main() -> None:
     init = read_init()
-    audio_q: "queue.Queue[tuple[str, bytes | None]]" = queue.Queue()
+    # Ten seconds at Voxa's 100 ms chunk size. This is enough to absorb short
+    # network stalls while putting a hard ceiling on memory and stale latency.
+    audio_q: "queue.Queue[tuple[str, bytes | None]]" = queue.Queue(maxsize=100)
     start_stdin_reader(audio_q)
     try:
         asyncio.run(run_session(init, audio_q))

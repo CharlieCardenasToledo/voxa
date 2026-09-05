@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::json;
 use std::{
+    collections::VecDeque,
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
@@ -16,6 +17,7 @@ use tauri::{path::BaseDirectory, Manager};
 use tauri::{AppHandle, Emitter};
 
 const MODEL: &str = "gemini-3.5-transcribe-live";
+const CONNECTION_PREROLL_PACKETS: usize = 100;
 
 /// Rust's `tungstenite` (rustls) reproducibly hung waiting for
 /// `setupComplete` on this exact endpoint/model, even though the identical
@@ -243,9 +245,10 @@ fn spawn_transcriber(
         let mut accumulated_input = 0_u64;
         let mut accumulated_output = 0_u64;
         while !stop.load(Ordering::Relaxed) {
-            // Audio captured before a connection is ready is stale. Sending the
-            // backlog in a burst can immediately trigger Gemini rate limits.
-            while rx.try_recv().is_ok() {}
+            let _ = app.emit(
+                "transcription-status",
+                json!({"speaker":speaker,"state":"connecting"}),
+            );
 
             let child = match spawn_bridge(&app) {
                 Ok(child) => child,
@@ -292,13 +295,36 @@ fn spawn_transcriber(
             }
 
             retry_delay = Duration::from_secs(1);
-            // Drop chunks collected while Gemini was allocating the session;
-            // transcription should start from "connected".
-            while rx.try_recv().is_ok() {}
+            // Preserve a bounded tail captured while Gemini was connecting.
+            // Dropping the entire backlog lost questions spoken immediately
+            // after the user entered Live mode. Ten seconds is only ~320 KB.
+            let mut preroll = VecDeque::with_capacity(CONNECTION_PREROLL_PACKETS);
+            while let Ok(packet) = rx.try_recv() {
+                if preroll.len() == CONNECTION_PREROLL_PACKETS {
+                    preroll.pop_front();
+                }
+                preroll.push_back(packet);
+            }
             let _ = app.emit(
                 "transcription-status",
                 json!({"speaker":speaker,"state":"connected"}),
             );
+
+            let mut preroll_failed = false;
+            for packet in preroll {
+                let message = match packet {
+                    LivePacket::Audio(pcm) => json!({"audio": STANDARD.encode(pcm)}),
+                    LivePacket::AudioStreamEnd => json!({"end": true}),
+                };
+                if write_line(&mut stdin, &message).is_err() {
+                    preroll_failed = true;
+                    break;
+                }
+            }
+            if preroll_failed {
+                let _ = child.kill();
+                continue;
+            }
 
             let connected_at = Instant::now();
             let mut session_input = 0_u64;
@@ -330,7 +356,7 @@ fn spawn_transcriber(
                             // Rotate at a natural silence boundary, then allow
                             // the final transcript enough time to arrive.
                             graceful_rotation_deadline =
-                                Some(Instant::now() + Duration::from_secs(2));
+                                Some(Instant::now() + Duration::from_secs(5));
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {}

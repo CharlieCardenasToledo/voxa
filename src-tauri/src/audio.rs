@@ -61,7 +61,9 @@ impl Default for VoiceActivityDetector {
     fn default() -> Self {
         Self {
             threshold: 0.012,
-            silence_chunks_to_end: 5,
+            // 800 ms tolerates a short thinking/breathing pause without
+            // splitting one audience question into two incomplete turns.
+            silence_chunks_to_end: 8,
             speech_chunks: 0,
             silence_chunks: 0,
             active: false,
@@ -130,12 +132,12 @@ mod tests {
         assert_eq!(resample_linear(&[0.0, 1.0, 0.0, 1.0], 4, 2).len(), 2);
     }
     #[test]
-    fn vad_ends_after_five_silent_chunks() {
+    fn vad_ends_after_eight_silent_chunks() {
         let mut vad = VoiceActivityDetector::default();
         let voice = to_pcm16(&[0.5; 1600]);
         let silence = to_pcm16(&[0.0; 1600]);
         assert_eq!(vad.observe(&voice), VadEvent::SpeechStarted);
-        for _ in 0..4 {
+        for _ in 0..7 {
             assert_eq!(vad.observe(&silence), VadEvent::Silence);
         }
         assert_eq!(vad.observe(&silence), VadEvent::SpeechEnded);
